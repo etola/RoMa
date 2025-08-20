@@ -11,4 +11,6 @@ h5py
 wandb
 timm
 poselib
+pycolmap
+open3d
 #xformers # Optional, used for memefficient attention

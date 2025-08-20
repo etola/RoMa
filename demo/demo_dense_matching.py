@@ -33,6 +33,7 @@ from typing import List, Tuple, Dict, Optional
 import time
 from collections import defaultdict
 from contextlib import contextmanager
+from functools import lru_cache
 
 import numpy as np
 import torch
@@ -123,6 +124,99 @@ class Profiler:
             json.dump(summary, f, indent=2)
 
 
+class ImageCache:
+    """Smart image cache to avoid repeated loading and resizing."""
+    
+    def __init__(self, max_cache_size: int = 50):
+        """
+        Initialize image cache.
+        
+        Args:
+            max_cache_size: Maximum number of cached image variants
+        """
+        self.max_cache_size = max_cache_size
+        self.cache = {}  # Key: (image_path, width, height, is_numpy), Value: cached_image
+        self.access_order = []  # For LRU eviction
+        
+    def _make_key(self, image_path: str, width: int = None, height: int = None, as_numpy: bool = False):
+        """Create cache key."""
+        return (str(image_path), width, height, as_numpy)
+    
+    def _evict_lru(self):
+        """Remove least recently used item."""
+        if len(self.cache) >= self.max_cache_size and self.access_order:
+            lru_key = self.access_order.pop(0)
+            if lru_key in self.cache:
+                del self.cache[lru_key]
+    
+    def _update_access(self, key):
+        """Update access order for LRU."""
+        if key in self.access_order:
+            self.access_order.remove(key)
+        self.access_order.append(key)
+    
+    def get_image(self, image_path: str, width: int = None, height: int = None, as_numpy: bool = False):
+        """
+        Get image from cache or load it.
+        
+        Args:
+            image_path: Path to image file
+            width, height: Target size (None for original size)
+            as_numpy: Return as numpy array (0-1 float) instead of PIL Image
+            
+        Returns:
+            PIL Image or numpy array
+        """
+        key = self._make_key(image_path, width, height, as_numpy)
+        
+        # Check cache
+        if key in self.cache:
+            self._update_access(key)
+            return self.cache[key]
+        
+        # Load and potentially resize image
+        img = Image.open(image_path)
+        
+        if width is not None and height is not None:
+            img = img.resize((width, height), Image.LANCZOS)
+        
+        # Convert to numpy if requested
+        if as_numpy:
+            result = np.array(img) / 255.0
+        else:
+            result = img
+        
+        # Cache the result
+        self._evict_lru()
+        self.cache[key] = result
+        self._update_access(key)
+        
+        return result
+    
+    def clear(self):
+        """Clear all cached images."""
+        self.cache.clear()
+        self.access_order.clear()
+    
+    def get_stats(self):
+        """Get cache statistics."""
+        total_memory = 0
+        for img in self.cache.values():
+            if hasattr(img, 'nbytes'):  # numpy array
+                total_memory += img.nbytes
+            elif hasattr(img, 'size'):  # PIL Image  
+                # Estimate PIL image memory usage
+                width, height = img.size
+                channels = len(img.getbands()) if hasattr(img, 'getbands') else 3
+                total_memory += width * height * channels
+        
+        return {
+            'cached_items': len(self.cache),
+            'max_size': self.max_cache_size,
+            'memory_usage_mb': total_memory / (1024*1024)
+        }
+
+
 class DenseMatchingPipeline:
     """Pipeline for dense matching and point cloud generation."""
     
@@ -135,7 +229,8 @@ class DenseMatchingPipeline:
                  min_triangulation_angle: float = 2.0,
                  save_visualizations: bool = False,
                  enable_prescaling: bool = True,
-                 command_args: Optional[Dict] = None):
+                 command_args: Optional[Dict] = None,
+                 cache_size: int = 100):
         """
         Initialize dense matching pipeline.
         
@@ -149,6 +244,7 @@ class DenseMatchingPipeline:
             save_visualizations: Whether to save match visualizations (default: False)
             enable_prescaling: Pre-scale images for tiny_roma model (speeds up processing)
             command_args: Dictionary of command line arguments used to call the program
+            cache_size: Maximum number of cached image variants (higher = faster but more memory)
         """
         self.colmap_path = Path(colmap_path)
         self.images_dir = Path(images_dir)
@@ -196,6 +292,9 @@ class DenseMatchingPipeline:
         
         # Performance profiler
         self.profiler = Profiler()
+        
+        # Image cache for faster loading
+        self.image_cache = ImageCache(max_cache_size=cache_size)
         
         # Scene bounding box (computed once)
         self.scene_bbox = None
@@ -246,9 +345,21 @@ class DenseMatchingPipeline:
                 continue
             
             try:
-                # Load and resize image
-                img = Image.open(original_path)
-                img_resized = resize_with_max_size(img, max_size)
+                # Load original image using cache
+                img = self.image_cache.get_image(str(original_path))
+                
+                # Calculate target dimensions
+                w, h = img.size
+                if max(w, h) > max_size:
+                    if w > h:
+                        new_w, new_h = max_size, int(h * max_size / w)
+                    else:
+                        new_w, new_h = int(w * max_size / h), max_size
+                    
+                    # Get resized image from cache
+                    img_resized = self.image_cache.get_image(str(original_path), new_w, new_h)
+                else:
+                    img_resized = img
                 
                 # Save scaled image
                 img_resized.save(scaled_path, quality=95)
@@ -340,8 +451,9 @@ class DenseMatchingPipeline:
         if self.model_type == "roma_outdoor":
             with self.profiler.profile("image_loading_and_resize"):
                 H, W = self.roma_model.get_output_resolution()
-                img1 = Image.open(img_path1).resize((W, H))
-                img2 = Image.open(img_path2).resize((W, H))
+                # Use cache for faster loading and resizing
+                img1 = self.image_cache.get_image(str(img_path1), W, H)
+                img2 = self.image_cache.get_image(str(img_path2), W, H)
             
             # Perform matching
             with self.profiler.profile("roma_model_inference"):
@@ -362,8 +474,9 @@ class DenseMatchingPipeline:
                 
                 # Load scaled images to get their sizes for logging
                 with self.profiler.profile("image_loading_tiny_roma"):
-                    img1_resized = Image.open(scaled_path1)
-                    img2_resized = Image.open(scaled_path2)
+                    # Use cache even for pre-scaled images
+                    img1_resized = self.image_cache.get_image(str(scaled_path1))
+                    img2_resized = self.image_cache.get_image(str(scaled_path2))
                 
                 H, W = warp.shape[:2]
                 # Store actual resolution for tiny_roma on first match
@@ -380,22 +493,26 @@ class DenseMatchingPipeline:
                 max_size = 800  # Limit maximum dimension to control memory usage
                 
                 with self.profiler.profile("image_loading_and_resize_fallback"):
-                    img1 = Image.open(img_path1)
-                    img2 = Image.open(img_path2)
+                    # Load original images from cache first
+                    img1 = self.image_cache.get_image(str(img_path1))
+                    img2 = self.image_cache.get_image(str(img_path2))
                     
-                    # Resize while maintaining aspect ratio
-                    def resize_with_max_size(img, max_size):
+                    # Calculate target sizes while maintaining aspect ratio
+                    def get_resized_dimensions(img, max_size):
                         w, h = img.size
                         if max(w, h) > max_size:
                             if w > h:
-                                new_w, new_h = max_size, int(h * max_size / w)
+                                return max_size, int(h * max_size / w)
                             else:
-                                new_w, new_h = int(w * max_size / h), max_size
-                            return img.resize((new_w, new_h))
-                        return img
+                                return int(w * max_size / h), max_size
+                        return w, h
                     
-                    img1_resized = resize_with_max_size(img1, max_size)
-                    img2_resized = resize_with_max_size(img2, max_size)
+                    new_w1, new_h1 = get_resized_dimensions(img1, max_size)
+                    new_w2, new_h2 = get_resized_dimensions(img2, max_size)
+                    
+                    # Get resized images from cache
+                    img1_resized = self.image_cache.get_image(str(img_path1), new_w1, new_h1)
+                    img2_resized = self.image_cache.get_image(str(img_path2), new_w2, new_h2)
                 
                 # Save temporarily and match
                 import tempfile
@@ -492,27 +609,56 @@ class DenseMatchingPipeline:
         logger.info(f"  Camera centers: {cam_center1} -> {cam_center2}")
         logger.info(f"  Baseline: {baseline_actual:.3f}m")
         
-        # Load original images for colors
+        # Load images for colors (with smart caching for tiny_roma)
         with self.profiler.profile("image_loading_for_colors"):
             img_path1 = self.colmap_dataset.get_image_path(img_id1, self.images_dir)
             img_path2 = self.colmap_dataset.get_image_path(img_id2, self.images_dir)
             
-            img1 = Image.open(img_path1)
-            img2 = Image.open(img_path2)
-            
-            # Get original image sizes
-            orig_w1, orig_h1 = img1.size
-            orig_w2, orig_h2 = img2.size
-            
-            # Get warp resolution and ensure images match exactly
+            # Get warp resolution 
             H, W = warp.shape[:2]
-            # For tiny roma, ensure we resize to match warp output exactly
-            img1_resized = img1.resize((W, H), Image.LANCZOS)
-            img2_resized = img2.resize((W, H), Image.LANCZOS)
             
-            # Convert to numpy
-            img1_np = np.array(img1_resized) / 255.0
-            img2_np = np.array(img2_resized) / 255.0
+            # For tiny_roma with prescaling, use the pre-scaled images directly
+            if (self.model_type == "tiny_roma" and self.enable_prescaling):
+                img1_name = self.colmap_dataset.images[img_id1].name
+                img2_name = self.colmap_dataset.images[img_id2].name
+                scaled_path1 = self.scaled_images_dir / img1_name
+                scaled_path2 = self.scaled_images_dir / img2_name
+                
+                if scaled_path1.exists() and scaled_path2.exists():
+                    # Use pre-scaled images directly - they should match warp dimensions!
+                    img1_prescaled = self.image_cache.get_image(str(scaled_path1))
+                    img2_prescaled = self.image_cache.get_image(str(scaled_path2))
+                    
+                    # Get original image sizes for camera scaling calculations
+                    orig_w1, orig_h1 = self.image_cache.get_image(str(img_path1)).size
+                    orig_w2, orig_h2 = self.image_cache.get_image(str(img_path2)).size
+                    
+                    # Check if pre-scaled images match warp dimensions exactly
+                    if img1_prescaled.size == (W, H):
+                        # Perfect match - use pre-scaled images as numpy arrays directly
+                        with self.profiler.profile("prescaled_image_reuse_perfect"):
+                            img1_np = self.image_cache.get_image(str(scaled_path1), as_numpy=True)
+                            img2_np = self.image_cache.get_image(str(scaled_path2), as_numpy=True)
+                        logger.info(f"  Using pre-scaled images directly (perfect size match: {W}x{H})")
+                    else:
+                        # Minor resize needed - but still use pre-scaled as starting point
+                        with self.profiler.profile("prescaled_image_reuse_minor_resize"):
+                            img1_np = self.image_cache.get_image(str(scaled_path1), W, H, as_numpy=True)
+                            img2_np = self.image_cache.get_image(str(scaled_path2), W, H, as_numpy=True)
+                        logger.info(f"  Using pre-scaled images with minor resize: {img1_prescaled.size} -> {W}x{H}")
+                else:
+                    # Fallback to original images (shouldn't happen often)
+                    logger.warning(f"  Pre-scaled images not found, using originals")
+                    orig_w1, orig_h1 = self.image_cache.get_image(str(img_path1)).size
+                    orig_w2, orig_h2 = self.image_cache.get_image(str(img_path2)).size
+                    img1_np = self.image_cache.get_image(str(img_path1), W, H, as_numpy=True)
+                    img2_np = self.image_cache.get_image(str(img_path2), W, H, as_numpy=True)
+            else:
+                # For roma_outdoor or tiny_roma without prescaling - use original images
+                orig_w1, orig_h1 = self.image_cache.get_image(str(img_path1)).size
+                orig_w2, orig_h2 = self.image_cache.get_image(str(img_path2)).size
+                img1_np = self.image_cache.get_image(str(img_path1), W, H, as_numpy=True)
+                img2_np = self.image_cache.get_image(str(img_path2), W, H, as_numpy=True)
         
         # Sample high-certainty correspondences
         with self.profiler.profile("correspondence_extraction"):
@@ -860,6 +1006,13 @@ class DenseMatchingPipeline:
                     point_clouds.append(pcd)
                 else:
                     logger.warning(f"  Empty point cloud generated for pair {i+1}")
+                
+                # Clear cache every 20 pairs to prevent excessive memory usage in long runs
+                if (i + 1) % 20 == 0:
+                    cache_stats = self.image_cache.get_stats()
+                    if cache_stats['memory_usage_mb'] > 1000:  # If cache uses > 1GB
+                        logger.info(f"  Clearing image cache (was using {cache_stats['memory_usage_mb']:.1f} MB)")
+                        self.image_cache.clear()
             except Exception as e:
                 logger.error(f"  Failed to process pair {i+1}: {e}")
                 continue
@@ -882,6 +1035,16 @@ class DenseMatchingPipeline:
             
             # Print profiling summary
             self.profiler.print_summary()
+            
+            # Print cache statistics
+            cache_stats = self.image_cache.get_stats()
+            logger.info(f"\n" + "="*60)
+            logger.info("IMAGE CACHE STATISTICS")
+            logger.info("="*60)
+            logger.info(f"Cached image variants: {cache_stats['cached_items']}")
+            logger.info(f"Max cache size: {cache_stats['max_size']}")
+            logger.info(f"Estimated memory usage: {cache_stats['memory_usage_mb']:.1f} MB")
+            logger.info("="*60)
             
             # Save detailed profiling data to JSON
             profiling_path = self.output_dir / "profiling_data.json"
@@ -969,6 +1132,16 @@ class DenseMatchingPipeline:
                 else:
                     f.write(f"  No profiling data available\n")
                 f.write(f"\n")
+                
+                # Write image cache statistics
+                cache_stats = self.image_cache.get_stats()
+                f.write(f"Image Cache Statistics:\n")
+                f.write(f"-----------------------\n")
+                f.write(f"  Cached image variants: {cache_stats['cached_items']}\n")
+                f.write(f"  Max cache size: {cache_stats['max_size']}\n")
+                f.write(f"  Estimated memory usage: {cache_stats['memory_usage_mb']:.1f} MB\n")
+                f.write(f"\n")
+                
                 f.write(f"Image pairs processed:\n")
                 for i, (img_id1, img_id2, point_count) in enumerate(self.point_cloud_metadata):
                     name1 = self.colmap_dataset.images[img_id1].name
@@ -1014,6 +1187,8 @@ def main():
                        help="Enable saving of match visualizations")
     parser.add_argument("-S", "--disable_prescaling", action="store_true",
                        help="Disable image pre-scaling for tiny_roma model (slower but uses less disk space)")
+    parser.add_argument("--cache_size", type=int, default=100,
+                       help="Maximum number of cached image variants (higher = faster but more memory)")
     
     args = parser.parse_args()
     
@@ -1087,7 +1262,8 @@ def main():
         'disable_bbox_filter': args.disable_bbox_filter,
         'min_triangulation_angle': args.min_triangulation_angle,
         'enable_visualizations': args.enable_visualizations,
-        'disable_prescaling': args.disable_prescaling
+        'disable_prescaling': args.disable_prescaling,
+        'cache_size': args.cache_size
     }
     
     # Create pipeline
@@ -1100,7 +1276,8 @@ def main():
         min_triangulation_angle=args.min_triangulation_angle,
         save_visualizations=args.enable_visualizations,
         enable_prescaling=not args.disable_prescaling,
-        command_args=command_args
+        command_args=command_args,
+        cache_size=args.cache_size
     )
     
     # Run pipeline

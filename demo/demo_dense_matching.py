@@ -107,15 +107,13 @@ class DenseMatchingPipeline:
                           min_common_points: int = 100,
                           min_baseline: float = 0.1,
                           max_baseline: float = 2.0,
-                          max_pairs: Optional[int] = 20,
                           max_pairs_per_image: int = 5) -> List[Tuple[int, int, Dict]]:
-        """Select good image pairs for dense matching with balanced coverage."""
+        """Select good image pairs for dense matching using per-image selection."""
         logger.info("Selecting image pairs...")
         pairs = self.colmap_dataset.select_image_pairs(
             min_common_points=min_common_points,
             min_baseline=min_baseline, 
             max_baseline=max_baseline,
-            max_pairs=max_pairs,
             max_pairs_per_image=max_pairs_per_image
         )
         
@@ -595,7 +593,6 @@ class DenseMatchingPipeline:
             min_common_points: int = 100,
             min_baseline: float = 0.1,
             max_baseline: float = 2.0,
-            max_pairs: Optional[int] = 20,
             max_pairs_per_image: int = 5,
             use_bbox_filter: bool = True,
             max_points: int = 100000):
@@ -606,8 +603,7 @@ class DenseMatchingPipeline:
             min_common_points: Minimum number of shared 3D points for pair selection
             min_baseline: Minimum baseline distance for pair selection
             max_baseline: Maximum baseline distance for pair selection
-            max_pairs: Maximum total number of pairs to process
-            max_pairs_per_image: Maximum pairs per image for balanced coverage
+            max_pairs_per_image: Maximum pairs per image (duplicates are automatically removed)
             use_bbox_filter: Whether to filter points using scene bounding box
             max_points: Maximum number of points to triangulate per pair
         """
@@ -618,7 +614,6 @@ class DenseMatchingPipeline:
             min_common_points=min_common_points,
             min_baseline=min_baseline,
             max_baseline=max_baseline,
-            max_pairs=max_pairs,
             max_pairs_per_image=max_pairs_per_image
         )
         
@@ -697,10 +692,8 @@ def main():
                        help="Minimum baseline distance for pair selection")
     parser.add_argument("--max_baseline", type=float, default=2.0,
                        help="Maximum baseline distance for pair selection")
-    parser.add_argument("--max_pairs", type=int, default=20,
-                       help="Maximum number of pairs to process")
     parser.add_argument("--max_pairs_per_image", type=int, default=5,
-                       help="Maximum number of pairs per image for balanced coverage")
+                       help="Maximum pairs per image (duplicates automatically removed)")
     parser.add_argument("--max_points", type=int, default=100000,
                        help="Maximum number of points to triangulate per pair")
     parser.add_argument("--disable_bbox_filter", action="store_true",
@@ -737,7 +730,6 @@ def main():
         min_common_points=args.min_common_points,
         min_baseline=args.min_baseline,
         max_baseline=args.max_baseline,
-        max_pairs=args.max_pairs,
         max_pairs_per_image=args.max_pairs_per_image,
         use_bbox_filter=not args.disable_bbox_filter,
         max_points=args.max_points

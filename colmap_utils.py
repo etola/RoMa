@@ -194,123 +194,93 @@ class COLMAPDataset:
                           min_common_points: int = 100,
                           min_baseline: float = 0.1,
                           max_baseline: float = 2.0,
-                          max_pairs: Optional[int] = None,
                           max_pairs_per_image: int = 5) -> List[Tuple[int, int, Dict]]:
         """
-        Select good image pairs for dense matching with balanced coverage:
-        - Each image appears in at least one pair (if possible)
-        - Each image appears in at most max_pairs_per_image pairs
-        - Prioritizes quality while ensuring coverage
+        Select good image pairs for dense matching using per-image selection:
+        - For each image, select up to max_pairs_per_image best quality pairs
+        - Remove duplicate pairs from the combined selection
+        - Process all unique pairs found
         
         Args:
             min_common_points: Minimum number of shared 3D points
             min_baseline: Minimum baseline distance
             max_baseline: Maximum baseline distance  
-            max_pairs: Maximum total number of pairs to return
-            max_pairs_per_image: Maximum pairs per image (default: 5)
+            max_pairs_per_image: Maximum pairs per image to select
             
         Returns:
-            List of (img_id1, img_id2, metadata) tuples with balanced coverage
+            List of (img_id1, img_id2, metadata) tuples sorted by quality
         """
         image_ids = list(self.images.keys())
+        logger.info(f"Selecting image pairs for {len(image_ids)} images (max {max_pairs_per_image} pairs per image)")
         
-        # First, generate all valid candidate pairs
-        all_candidates = []
+        # Helper function to create pair metadata
+        def create_pair_metadata(img_id1: int, img_id2: int) -> Dict:
+            common_points = self.get_common_points(img_id1, img_id2)
+            baseline = self.compute_baseline(img_id1, img_id2)
+            R_rel, _ = self.get_relative_pose(img_id1, img_id2)
+            angle = np.arccos(np.clip((np.trace(R_rel) - 1) / 2, -1, 1))
+            angle_deg = np.degrees(angle)
+            quality = len(common_points) * baseline / (1 + angle_deg / 30)
+            
+            return {
+                'common_points': len(common_points),
+                'baseline': baseline,
+                'angle_deg': angle_deg,
+                'quality': quality,
+                'point_ids': common_points
+            }
         
-        for i, img_id1 in enumerate(image_ids):
-            for img_id2 in image_ids[i+1:]:
+        # Use a set to automatically handle duplicate removal
+        # Store as (min_id, max_id, metadata) to ensure consistent ordering
+        unique_pairs = {}
+        
+        # For each image, find its best pairs
+        for img_id in image_ids:
+            candidates_for_image = []
+            
+            # Find all valid pairs involving this image
+            for other_img_id in image_ids:
+                if img_id == other_img_id:
+                    continue
+                
                 # Check common points
-                common_points = self.get_common_points(img_id1, img_id2)
+                common_points = self.get_common_points(img_id, other_img_id)
                 if len(common_points) < min_common_points:
                     continue
                 
                 # Check baseline
-                baseline = self.compute_baseline(img_id1, img_id2)
+                baseline = self.compute_baseline(img_id, other_img_id)
                 if baseline < min_baseline or baseline > max_baseline:
                     continue
                 
-                # Compute viewing angle
-                R_rel, _ = self.get_relative_pose(img_id1, img_id2)
-                angle = np.arccos(np.clip((np.trace(R_rel) - 1) / 2, -1, 1))
-                angle_deg = np.degrees(angle)
-                
-                # Quality score (higher is better)
-                quality = len(common_points) * baseline / (1 + angle_deg / 30)
-                
-                all_candidates.append((
-                    img_id1, img_id2, {
-                        'common_points': len(common_points),
-                        'baseline': baseline,
-                        'angle_deg': angle_deg,
-                        'quality': quality,
-                        'point_ids': common_points
-                    }
-                ))
+                # Create metadata and add to candidates
+                metadata = create_pair_metadata(img_id, other_img_id)
+                candidates_for_image.append((img_id, other_img_id, metadata))
+            
+            # Sort by quality and take the best ones
+            candidates_for_image.sort(key=lambda x: x[2]['quality'], reverse=True)
+            best_pairs = candidates_for_image[:max_pairs_per_image]
+            
+            # Add to unique pairs set (with consistent ordering to avoid duplicates)
+            for img_id1, img_id2, metadata in best_pairs:
+                pair_key = (min(img_id1, img_id2), max(img_id1, img_id2))
+                if pair_key not in unique_pairs or unique_pairs[pair_key][2]['quality'] < metadata['quality']:
+                    unique_pairs[pair_key] = (pair_key[0], pair_key[1], metadata)
         
-        # Sort all candidates by quality (best first)
-        all_candidates.sort(key=lambda x: x[2]['quality'], reverse=True)
-        
-        # Create data structures for balanced selection
-        image_pair_counts = {img_id: 0 for img_id in image_ids}
-        selected_pairs = []
-        remaining_candidates = all_candidates.copy()
-        
-        # Phase 1: Ensure each image appears in at least one pair
-        images_without_pairs = set(image_ids)
-        
-        while images_without_pairs and remaining_candidates:
-            for i, (img_id1, img_id2, metadata) in enumerate(remaining_candidates):
-                # Check if this pair helps cover uncovered images
-                helps_coverage = (img_id1 in images_without_pairs or 
-                                img_id2 in images_without_pairs)
-                
-                # Check if we can add this pair without exceeding limits
-                can_add = (image_pair_counts[img_id1] < max_pairs_per_image and
-                          image_pair_counts[img_id2] < max_pairs_per_image)
-                
-                if helps_coverage and can_add:
-                    # Add this pair
-                    selected_pairs.append((img_id1, img_id2, metadata))
-                    image_pair_counts[img_id1] += 1
-                    image_pair_counts[img_id2] += 1
-                    
-                    # Remove from uncovered sets
-                    images_without_pairs.discard(img_id1)
-                    images_without_pairs.discard(img_id2)
-                    
-                    # Remove from remaining candidates
-                    remaining_candidates.pop(i)
-                    break
-            else:
-                # No suitable pair found, break to avoid infinite loop
-                break
-        
-        # Phase 2: Add remaining high-quality pairs while respecting limits
-        for img_id1, img_id2, metadata in remaining_candidates:
-            # Check if we can add this pair
-            if (image_pair_counts[img_id1] < max_pairs_per_image and
-                image_pair_counts[img_id2] < max_pairs_per_image):
-                
-                selected_pairs.append((img_id1, img_id2, metadata))
-                image_pair_counts[img_id1] += 1
-                image_pair_counts[img_id2] += 1
-                
-                # Stop if we've reached max_pairs limit
-                if max_pairs is not None and len(selected_pairs) >= max_pairs:
-                    break
-        
-        # Sort final selection by quality
+        # Convert to list and sort by quality
+        selected_pairs = list(unique_pairs.values())
         selected_pairs.sort(key=lambda x: x[2]['quality'], reverse=True)
         
-        # Apply max_pairs limit if specified
-        if max_pairs is not None:
-            selected_pairs = selected_pairs[:max_pairs]
-        
         # Log statistics
-        covered_images = len([img_id for img_id in image_ids if image_pair_counts[img_id] > 0])
-        avg_pairs_per_image = np.mean([count for count in image_pair_counts.values() if count > 0])
+        image_pair_counts = {img_id: 0 for img_id in image_ids}
+        for img_id1, img_id2, _ in selected_pairs:
+            image_pair_counts[img_id1] += 1
+            image_pair_counts[img_id2] += 1
         
-        logger.info(f"Selected {len(selected_pairs)} image pairs from {len(image_ids)} images")
+        covered_images = len([img_id for img_id in image_ids if image_pair_counts[img_id] > 0])
+        avg_pairs_per_image = np.mean([count for count in image_pair_counts.values() if count > 0]) if covered_images > 0 else 0
+        
+        logger.info(f"Selected {len(selected_pairs)} unique image pairs from {len(image_ids)} images")
         logger.info(f"Coverage: {covered_images}/{len(image_ids)} images have at least one pair")
         logger.info(f"Average pairs per covered image: {avg_pairs_per_image:.1f}")
         

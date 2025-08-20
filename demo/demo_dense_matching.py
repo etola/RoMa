@@ -55,7 +55,9 @@ class DenseMatchingPipeline:
                  images_dir: str,
                  output_dir: str,
                  model_type: str = "roma_outdoor",
-                 resolution: Tuple[int, int] = (864, 1152)):
+                 resolution: Tuple[int, int] = (864, 1152),
+                 min_triangulation_angle: float = 2.0,
+                 save_visualizations: bool = True):
         """
         Initialize dense matching pipeline.
         
@@ -70,12 +72,15 @@ class DenseMatchingPipeline:
         self.images_dir = Path(images_dir)
         self.output_dir = Path(output_dir)
         self.resolution = resolution
+        self.min_triangulation_angle = min_triangulation_angle
+        self.save_visualizations = save_visualizations
         
         # Create output directories
         self.output_dir.mkdir(parents=True, exist_ok=True)
         (self.output_dir / "point_clouds").mkdir(exist_ok=True)
         (self.output_dir / "matches").mkdir(exist_ok=True)
-        (self.output_dir / "visualizations").mkdir(exist_ok=True)
+        if self.save_visualizations:
+            (self.output_dir / "visualizations").mkdir(exist_ok=True)
         
         # Load COLMAP data
         logger.info("Loading COLMAP reconstruction...")
@@ -386,6 +391,11 @@ class DenseMatchingPipeline:
         
         logger.info(f"  After depth filtering: {len(points_3d)} points")
         
+        # Filter points by triangulation angle (remove points with small viewing angles)
+        points_3d, colors = self.filter_by_triangulation_angle(
+            points_3d, colors, cam_center1, cam_center2, min_angle_degrees=self.min_triangulation_angle
+        )
+        
         # Optional: Filter by scene bounding box
         if use_bbox_filter and len(points_3d) > 0:
             scene_bbox = self.compute_scene_bounding_box()
@@ -468,8 +478,11 @@ class DenseMatchingPipeline:
         # Dense matching
         warp, certainty, match_info = self.dense_match_pair(img_id1, img_id2)
         
-        # Save visualization
-        self.save_visualization(warp, certainty, img_id1, img_id2)
+        # Save visualization (if enabled)
+        if self.save_visualizations:
+            self.save_visualization(warp, certainty, img_id1, img_id2)
+        else:
+            logger.info(f"  Visualizations disabled")
         
         # Generate point cloud
         pcd = self.generate_point_cloud(warp, certainty, img_id1, img_id2, use_bbox_filter=use_bbox_filter)
@@ -481,6 +494,58 @@ class DenseMatchingPipeline:
         
         return pcd
     
+    def filter_by_triangulation_angle(self, 
+                                     points_3d: np.ndarray, 
+                                     colors: np.ndarray,
+                                     cam_center1: np.ndarray, 
+                                     cam_center2: np.ndarray,
+                                     min_angle_degrees: float = 2.0) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Filter out 3D points with small triangulation angles for better accuracy.
+        
+        Args:
+            points_3d: (N, 3) array of 3D points in world coordinates
+            colors: (N, 3) array of RGB colors  
+            cam_center1: (3,) camera center 1 in world coordinates
+            cam_center2: (3,) camera center 2 in world coordinates
+            min_angle_degrees: minimum triangulation angle in degrees
+            
+        Returns:
+            Filtered points and colors
+        """
+        if len(points_3d) == 0:
+            return points_3d, colors
+            
+        # Compute rays from camera centers to each 3D point
+        rays1 = points_3d - cam_center1  # (N, 3)
+        rays2 = points_3d - cam_center2  # (N, 3)
+        
+        # Normalize rays
+        rays1_norm = rays1 / np.linalg.norm(rays1, axis=1, keepdims=True)
+        rays2_norm = rays2 / np.linalg.norm(rays2, axis=1, keepdims=True)
+        
+        # Compute triangulation angles using dot product
+        # cos(angle) = dot(ray1, ray2) / (|ray1| * |ray2|)
+        cos_angles = np.sum(rays1_norm * rays2_norm, axis=1)
+        
+        # Clamp to valid range for arccos (numerical stability)
+        cos_angles = np.clip(cos_angles, -1.0, 1.0)
+        
+        # Convert to angles in degrees
+        angles_rad = np.arccos(cos_angles)
+        angles_deg = np.degrees(angles_rad)
+        
+        # Filter points with sufficient triangulation angle
+        valid_angle_mask = angles_deg >= min_angle_degrees
+        
+        filtered_points = points_3d[valid_angle_mask]
+        filtered_colors = colors[valid_angle_mask]
+        
+        logger.info(f"  Triangulation angle filter: {len(filtered_points)}/{len(points_3d)} points retained "
+                   f"(min_angle: {min_angle_degrees}°, mean_angle: {np.mean(angles_deg[valid_angle_mask]):.1f}°)")
+        
+        return filtered_points, filtered_colors
+
     def merge_point_clouds(self, point_clouds: List[o3d.geometry.PointCloud]) -> o3d.geometry.PointCloud:
         """Merge multiple point clouds into one."""
         logger.info(f"\nMerging {len(point_clouds)} point clouds...")
@@ -615,6 +680,10 @@ def main():
                        help="Maximum number of pairs per image for balanced coverage")
     parser.add_argument("--disable_bbox_filter", action="store_true",
                        help="Disable bounding box filtering of point clouds")
+    parser.add_argument("--min_triangulation_angle", type=float, default=2.0,
+                       help="Minimum triangulation angle in degrees for point filtering (default: 2.0)")
+    parser.add_argument("--disable_visualizations", action="store_true",
+                       help="Disable saving of match visualizations to save space and speed")
     
     args = parser.parse_args()
     
@@ -633,7 +702,9 @@ def main():
         images_dir=args.images_dir,
         output_dir=args.output_dir,
         model_type=args.model_type,
-        resolution=tuple(args.resolution)
+        resolution=tuple(args.resolution),
+        min_triangulation_angle=args.min_triangulation_angle,
+        save_visualizations=not args.disable_visualizations
     )
     
     # Run pipeline

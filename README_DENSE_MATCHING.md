@@ -17,6 +17,7 @@ This directory contains a comprehensive dense matching pipeline that integrates 
 
 🌐 **3D Point Cloud Generation** - Creates detailed point clouds from matches:
 - Triangulation using camera calibration from COLMAP
+- **Triangulation angle filtering** - Removes points with poor geometric constraints
 - Color mapping from source images
 - Statistical outlier removal
 - Automatic filtering of invalid depths
@@ -85,6 +86,8 @@ python demo/demo_dense_matching.py \
 | `--max_pairs` | Maximum number of pairs to process | `20` |
 | `--max_pairs_per_image` | Maximum pairs per image for balanced coverage | `5` |
 | `--disable_bbox_filter` | Disable bounding box filtering of point clouds | `False` |
+| `--min_triangulation_angle` | Minimum triangulation angle in degrees for point filtering | `2.0` |
+| `--disable_visualizations` | Disable saving of match visualizations to save space and speed | `False` |
 
 ## Output Structure
 

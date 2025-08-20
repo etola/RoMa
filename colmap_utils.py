@@ -9,9 +9,9 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 import logging
 import json
+import cv2
 
 logger = logging.getLogger(__name__)
-
 
 class COLMAPDataset:
     """
@@ -595,14 +595,14 @@ class COLMAPDataset:
         logger.info(f"Exported bounding box to {output_path}")
 
 
-def triangulate_points(kpts1: np.ndarray, 
-                      kpts2: np.ndarray,
-                      K1: np.ndarray,
-                      K2: np.ndarray, 
-                      R: np.ndarray,
-                      t: np.ndarray) -> np.ndarray:
+def triangulate_points( kpts1: np.ndarray, 
+                        kpts2: np.ndarray,
+                        K1: np.ndarray,
+                        K2: np.ndarray, 
+                        R: np.ndarray,
+                        t: np.ndarray) -> np.ndarray:
     """
-    Triangulate 3D points from corresponding 2D points.
+    Fast triangulation using OpenCV (if available).
     
     Args:
         kpts1: (N, 2) keypoints in image 1
@@ -614,23 +614,29 @@ def triangulate_points(kpts1: np.ndarray,
     Returns:
         points3d: (N, 3) triangulated 3D points in camera 1 coordinate system
     """
+    if len(kpts1) == 0:
+        return np.empty((0, 3))
+    
     # Camera projection matrices
     P1 = K1 @ np.hstack([np.eye(3), np.zeros((3, 1))])
     P2 = K2 @ np.hstack([R, t])
     
-    # Triangulate using DLT
-    points3d = []
-    for i in range(len(kpts1)):
-        A = np.array([
-            kpts1[i, 0] * P1[2] - P1[0],
-            kpts1[i, 1] * P1[2] - P1[1], 
-            kpts2[i, 0] * P2[2] - P2[0],
-            kpts2[i, 1] * P2[2] - P2[1]
-        ])
-        
-        _, _, Vt = np.linalg.svd(A)
-        X = Vt[-1]
-        X = X[:3] / X[3]  # Convert from homogeneous coordinates
-        points3d.append(X)
+    # OpenCV expects points as (2, N) arrays
+    points1 = kpts1.T  # (2, N)
+    points2 = kpts2.T  # (2, N)
     
-    return np.array(points3d) 
+    # Triangulate using OpenCV (much faster than manual DLT)
+    points4d = cv2.triangulatePoints(P1, P2, points1, points2)
+    
+    # Convert from homogeneous coordinates to 3D
+    # Handle potential division by zero
+    w = points4d[3, :]
+    valid_mask = np.abs(w) > 1e-8
+    
+    points3d = np.zeros((len(kpts1), 3))
+    points3d[valid_mask, :] = (points4d[:3, valid_mask] / w[valid_mask]).T
+    
+    # For invalid points, set to origin
+    points3d[~valid_mask] = 0.0
+    
+    return points3d

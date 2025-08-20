@@ -471,8 +471,19 @@ class DenseMatchingPipeline:
         
         logger.info(f"  Saved visualizations: {vis_path.name}, {cert_path.name}")
     
-    def process_pair(self, img_id1: int, img_id2: int, pair_idx: int, use_bbox_filter: bool = True) -> o3d.geometry.PointCloud:
-        """Process a single image pair and return point cloud."""
+    def process_pair(self, img_id1: int, img_id2: int, pair_idx: int, use_bbox_filter: bool = True, max_points: int = 100000) -> o3d.geometry.PointCloud:
+        """
+        Process a single image pair and return point cloud.
+        
+        Args:
+            img_id1, img_id2: Image IDs to process
+            pair_idx: Index of this pair for logging
+            use_bbox_filter: Whether to filter points using scene bounding box
+            max_points: Maximum number of points to triangulate
+            
+        Returns:
+            Point cloud generated from the image pair
+        """
         logger.info(f"\n=== Processing pair {pair_idx + 1}: {img_id1} <-> {img_id2} ===")
         
         # Dense matching
@@ -485,7 +496,7 @@ class DenseMatchingPipeline:
             logger.info(f"  Visualizations disabled")
         
         # Generate point cloud
-        pcd = self.generate_point_cloud(warp, certainty, img_id1, img_id2, use_bbox_filter=use_bbox_filter)
+        pcd = self.generate_point_cloud(warp, certainty, img_id1, img_id2, use_bbox_filter=use_bbox_filter, max_points=max_points)
         
         # Save individual point cloud
         pcd_path = self.output_dir / "point_clouds" / f"cloud_{img_id1}_{img_id2}.ply"
@@ -586,8 +597,20 @@ class DenseMatchingPipeline:
             max_baseline: float = 2.0,
             max_pairs: Optional[int] = 20,
             max_pairs_per_image: int = 5,
-            use_bbox_filter: bool = True):
-        """Run the complete dense matching pipeline."""
+            use_bbox_filter: bool = True,
+            max_points: int = 100000):
+        """
+        Run the complete dense matching pipeline.
+        
+        Args:
+            min_common_points: Minimum number of shared 3D points for pair selection
+            min_baseline: Minimum baseline distance for pair selection
+            max_baseline: Maximum baseline distance for pair selection
+            max_pairs: Maximum total number of pairs to process
+            max_pairs_per_image: Maximum pairs per image for balanced coverage
+            use_bbox_filter: Whether to filter points using scene bounding box
+            max_points: Maximum number of points to triangulate per pair
+        """
         logger.info("=== Starting Dense Matching Pipeline ===")
         
         # Select image pairs
@@ -609,7 +632,7 @@ class DenseMatchingPipeline:
         
         for i, (img_id1, img_id2, metadata) in enumerate(pairs):
             try:
-                pcd = self.process_pair(img_id1, img_id2, i, use_bbox_filter=use_bbox_filter)
+                pcd = self.process_pair(img_id1, img_id2, i, use_bbox_filter=use_bbox_filter, max_points=max_points)
                 if len(pcd.points) > 0:
                     point_clouds.append(pcd)
                 else:
@@ -678,6 +701,8 @@ def main():
                        help="Maximum number of pairs to process")
     parser.add_argument("--max_pairs_per_image", type=int, default=5,
                        help="Maximum number of pairs per image for balanced coverage")
+    parser.add_argument("--max_points", type=int, default=100000,
+                       help="Maximum number of points to triangulate per pair")
     parser.add_argument("--disable_bbox_filter", action="store_true",
                        help="Disable bounding box filtering of point clouds")
     parser.add_argument("--min_triangulation_angle", type=float, default=2.0,
@@ -714,7 +739,8 @@ def main():
         max_baseline=args.max_baseline,
         max_pairs=args.max_pairs,
         max_pairs_per_image=args.max_pairs_per_image,
-        use_bbox_filter=not args.disable_bbox_filter
+        use_bbox_filter=not args.disable_bbox_filter,
+        max_points=args.max_points
     )
 
 

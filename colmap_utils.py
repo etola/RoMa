@@ -8,6 +8,7 @@ import pycolmap
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 import logging
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -194,7 +195,8 @@ class COLMAPDataset:
                           min_common_points: int = 100,
                           min_baseline: float = 0.1,
                           max_baseline: float = 2.0,
-                          max_pairs_per_image: int = 5) -> List[Tuple[int, int, Dict]]:
+                          max_pairs_per_image: int = 5,
+                          save_pairs_file: Optional[str] = None) -> List[Tuple[int, int, Dict]]:
         """
         Select good image pairs for dense matching using per-image selection:
         - For each image, select up to max_pairs_per_image best quality pairs
@@ -206,9 +208,10 @@ class COLMAPDataset:
             min_baseline: Minimum baseline distance
             max_baseline: Maximum baseline distance  
             max_pairs_per_image: Maximum pairs per image to select
+            save_pairs_file: Optional filename to save pairs information as JSON
             
         Returns:
-            List of (img_id1, img_id2, metadata) tuples sorted by quality
+            List of (img_id1, img_id2, metadata) tuples sorted by ascending image IDs
         """
         image_ids = list(self.images.keys())
         logger.info(f"Selecting image pairs for {len(image_ids)} images (max {max_pairs_per_image} pairs per image)")
@@ -267,9 +270,9 @@ class COLMAPDataset:
                 if pair_key not in unique_pairs or unique_pairs[pair_key][2]['quality'] < metadata['quality']:
                     unique_pairs[pair_key] = (pair_key[0], pair_key[1], metadata)
         
-        # Convert to list and sort by quality
+        # Convert to list and sort by ascending image IDs (primary), then by quality (secondary)
         selected_pairs = list(unique_pairs.values())
-        selected_pairs.sort(key=lambda x: x[2]['quality'], reverse=True)
+        selected_pairs.sort(key=lambda x: (x[0], x[1], -x[2]['quality']))
         
         # Log statistics
         image_pair_counts = {img_id: 0 for img_id in image_ids}
@@ -288,6 +291,29 @@ class COLMAPDataset:
         pair_counts = list(image_pair_counts.values())
         logger.info(f"Pair distribution - Min: {min(pair_counts)}, Max: {max(pair_counts)}, "
                    f"Images with 0 pairs: {pair_counts.count(0)}")
+        
+        logger.info(f"Pairs sorted by ascending image IDs")
+        
+        # Save pairs information to JSON file if requested
+        if save_pairs_file:
+            pairs_data = []
+            for img_id1, img_id2, metadata in selected_pairs:
+                pair_info = {
+                    'image_id1': int(img_id1),
+                    'image_id2': int(img_id2), 
+                    'image_name1': self.images[img_id1].name,
+                    'image_name2': self.images[img_id2].name,
+                    'common_points': metadata['common_points'],
+                    'baseline': float(metadata['baseline']),
+                    'angle_deg': float(metadata['angle_deg']),
+                    'quality': float(metadata['quality'])
+                }
+                pairs_data.append(pair_info)
+            
+            save_path = Path(save_pairs_file)
+            with open(save_path, 'w') as f:
+                json.dump(pairs_data, f, indent=2)
+            logger.info(f"Saved {len(selected_pairs)} pairs information to {save_path}")
         
         return selected_pairs
     

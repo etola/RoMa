@@ -16,6 +16,7 @@ import os
 import sys
 import logging
 import tempfile
+import json
 from pathlib import Path
 from argparse import ArgumentParser
 from typing import List, Tuple, Dict, Optional
@@ -57,7 +58,8 @@ class DenseMatchingPipeline:
                  model_type: str = "roma_outdoor",
                  resolution: Tuple[int, int] = (864, 1152),
                  min_triangulation_angle: float = 2.0,
-                 save_visualizations: bool = True):
+                 save_visualizations: bool = True,
+                 enable_prescaling: bool = True):
         """
         Initialize dense matching pipeline.
         
@@ -67,6 +69,9 @@ class DenseMatchingPipeline:
             output_dir: Output directory for results
             model_type: RoMa model type ("roma_outdoor" or "tiny_roma")
             resolution: Target resolution for matching
+            min_triangulation_angle: Minimum triangulation angle in degrees
+            save_visualizations: Whether to save match visualizations
+            enable_prescaling: Pre-scale images for tiny_roma model (speeds up processing)
         """
         self.colmap_path = Path(colmap_path)
         self.images_dir = Path(images_dir)
@@ -103,18 +108,82 @@ class DenseMatchingPipeline:
         # Scene bounding box (computed once)
         self.scene_bbox = None
         
+        # Scaled images directory for tiny model optimization
+        self.scaled_images_dir = self.output_dir / "scaled_images"
+        
+        # Pre-scale images if using tiny model (optimization)
+        self.enable_prescaling = enable_prescaling
+        if self.model_type == "tiny_roma" and self.enable_prescaling:
+            self._prescale_images_for_tiny_model()
+    
+    def _prescale_images_for_tiny_model(self):
+        """
+        Pre-scale all images for tiny RoMa model to avoid repeated resizing.
+        Images are saved to scaled_images/ directory with the same filenames.
+        """
+        logger.info("Pre-scaling images for tiny RoMa model...")
+        
+        # Create scaled images directory
+        self.scaled_images_dir.mkdir(exist_ok=True)
+        
+        max_size = 800  # Same as used in dense_match_pair
+        
+        # Resize function (same as in dense_match_pair)
+        def resize_with_max_size(img, max_size):
+            w, h = img.size
+            if max(w, h) > max_size:
+                if w > h:
+                    new_w, new_h = max_size, int(h * max_size / w)
+                else:
+                    new_w, new_h = int(w * max_size / h), max_size
+                return img.resize((new_w, new_h))
+            return img
+        
+        # Process all images in the dataset
+        processed_count = 0
+        skipped_count = 0
+        
+        for img_id, image in self.colmap_dataset.images.items():
+            img_name = image.name
+            original_path = Path(self.images_dir) / img_name
+            scaled_path = self.scaled_images_dir / img_name
+            
+            # Skip if already exists and is newer than original
+            if scaled_path.exists() and scaled_path.stat().st_mtime > original_path.stat().st_mtime:
+                skipped_count += 1
+                continue
+            
+            try:
+                # Load and resize image
+                img = Image.open(original_path)
+                img_resized = resize_with_max_size(img, max_size)
+                
+                # Save scaled image
+                img_resized.save(scaled_path, quality=95)
+                processed_count += 1
+                
+                if processed_count % 10 == 0:
+                    logger.info(f"  Processed {processed_count} images...")
+                    
+            except Exception as e:
+                logger.warning(f"  Failed to scale image {img_name}: {e}")
+        
+        logger.info(f"Pre-scaling complete: {processed_count} processed, {skipped_count} skipped (already up-to-date)")
+        
     def select_image_pairs(self, 
                           min_common_points: int = 100,
                           min_baseline: float = 0.1,
                           max_baseline: float = 2.0,
-                          max_pairs_per_image: int = 5) -> List[Tuple[int, int, Dict]]:
+                          max_pairs_per_image: int = 5,
+                          save_pairs_file: Optional[str] = None) -> List[Tuple[int, int, Dict]]:
         """Select good image pairs for dense matching using per-image selection."""
         logger.info("Selecting image pairs...")
         pairs = self.colmap_dataset.select_image_pairs(
             min_common_points=min_common_points,
             min_baseline=min_baseline, 
             max_baseline=max_baseline,
-            max_pairs_per_image=max_pairs_per_image
+            max_pairs_per_image=max_pairs_per_image,
+            save_pairs_file=save_pairs_file
         )
         
         logger.info(f"Selected {len(pairs)} image pairs")
@@ -185,54 +254,77 @@ class DenseMatchingPipeline:
             warp, certainty = self.roma_model.match(str(img_path1), str(img_path2), device=device)
             
         else:  # tiny_roma
-            # For tiny RoMa, we need to resize images manually for memory control
-            max_size = 800  # Limit maximum dimension to control memory usage
+            # Use pre-scaled images if available, otherwise resize on the fly
+            img1_name = self.colmap_dataset.images[img_id1].name
+            img2_name = self.colmap_dataset.images[img_id2].name
+            scaled_path1 = self.scaled_images_dir / img1_name
+            scaled_path2 = self.scaled_images_dir / img2_name
             
-            img1 = Image.open(img_path1)
-            img2 = Image.open(img_path2)
-            
-            # Resize while maintaining aspect ratio
-            def resize_with_max_size(img, max_size):
-                w, h = img.size
-                if max(w, h) > max_size:
-                    if w > h:
-                        new_w, new_h = max_size, int(h * max_size / w)
-                    else:
-                        new_w, new_h = int(w * max_size / h), max_size
-                    return img.resize((new_w, new_h))
-                return img
-            
-            img1_resized = resize_with_max_size(img1, max_size)
-            img2_resized = resize_with_max_size(img2, max_size)
-            
-            # Save temporarily and match
-            import tempfile
-            with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp1, \
-                 tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp2:
-                img1_resized.save(tmp1.name)
-                img2_resized.save(tmp2.name)
+            if (self.enable_prescaling and scaled_path1.exists() and scaled_path2.exists()):
+                # Use pre-scaled images - much faster!
+                logger.info(f"  Using pre-scaled images from {self.scaled_images_dir.name}/")
+                warp, certainty = self.roma_model.match(str(scaled_path1), str(scaled_path2))
                 
-                try:
-                    warp, certainty = self.roma_model.match(tmp1.name, tmp2.name)
-                    H, W = warp.shape[:2]
-                    logger.info(f"  Warp shape: {warp.shape}")
-                    logger.info(f"  Certainty shape: {certainty.shape}")
-                    logger.info(f"  Resized image 1: {img1_resized.size}")
-                    logger.info(f"  Resized image 2: {img2_resized.size}")
+                # Load scaled images to get their sizes for logging
+                img1_resized = Image.open(scaled_path1)
+                img2_resized = Image.open(scaled_path2)
+                
+                H, W = warp.shape[:2]
+                logger.info(f"  Warp shape: {warp.shape}")
+                logger.info(f"  Certainty shape: {certainty.shape}")
+                logger.info(f"  Scaled image 1: {img1_resized.size}")
+                logger.info(f"  Scaled image 2: {img2_resized.size}")
+                
+            else:
+                # Fallback: resize on the fly (should rarely happen after pre-scaling)
+                logger.warning(f"  Pre-scaled images not found, resizing on the fly...")
+                max_size = 800  # Limit maximum dimension to control memory usage
+                
+                img1 = Image.open(img_path1)
+                img2 = Image.open(img_path2)
+                
+                # Resize while maintaining aspect ratio
+                def resize_with_max_size(img, max_size):
+                    w, h = img.size
+                    if max(w, h) > max_size:
+                        if w > h:
+                            new_w, new_h = max_size, int(h * max_size / w)
+                        else:
+                            new_w, new_h = int(w * max_size / h), max_size
+                        return img.resize((new_w, new_h))
+                    return img
+                
+                img1_resized = resize_with_max_size(img1, max_size)
+                img2_resized = resize_with_max_size(img2, max_size)
+                
+                # Save temporarily and match
+                import tempfile
+                with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp1, \
+                     tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp2:
+                    img1_resized.save(tmp1.name)
+                    img2_resized.save(tmp2.name)
                     
-                    # Clean up temporary files
-                    os.unlink(tmp1.name)
-                    os.unlink(tmp2.name)
-                    
-                except Exception as e:
-                    logger.error(f"  Error during matching: {e}")
-                    # Clean up temporary files even on error
                     try:
+                        warp, certainty = self.roma_model.match(tmp1.name, tmp2.name)
+                        H, W = warp.shape[:2]
+                        logger.info(f"  Warp shape: {warp.shape}")
+                        logger.info(f"  Certainty shape: {certainty.shape}")
+                        logger.info(f"  Resized image 1: {img1_resized.size}")
+                        logger.info(f"  Resized image 2: {img2_resized.size}")
+                        
+                        # Clean up temporary files
                         os.unlink(tmp1.name)
                         os.unlink(tmp2.name)
-                    except:
-                        pass
-                    raise
+                        
+                    except Exception as e:
+                        logger.error(f"  Error during matching: {e}")
+                        # Clean up temporary files even on error
+                        try:
+                            os.unlink(tmp1.name)
+                            os.unlink(tmp2.name)
+                        except:
+                            pass
+                        raise
         
         match_time = time.time() - start_time
         
@@ -482,7 +574,6 @@ class DenseMatchingPipeline:
         Returns:
             Point cloud generated from the image pair
         """
-        logger.info(f"\n=== Processing pair {pair_idx + 1}: {img_id1} <-> {img_id2} ===")
         
         # Dense matching
         warp, certainty, match_info = self.dense_match_pair(img_id1, img_id2)
@@ -595,7 +686,8 @@ class DenseMatchingPipeline:
             max_baseline: float = 2.0,
             max_pairs_per_image: int = 5,
             use_bbox_filter: bool = True,
-            max_points: int = 100000):
+            max_points: int = 100000,
+            pairs_file: str = "pairs.json"):
         """
         Run the complete dense matching pipeline.
         
@@ -606,15 +698,22 @@ class DenseMatchingPipeline:
             max_pairs_per_image: Maximum pairs per image (duplicates are automatically removed)
             use_bbox_filter: Whether to filter points using scene bounding box
             max_points: Maximum number of points to triangulate per pair
+            pairs_file: Filename to save pairs information in output directory (default: pairs.json)
         """
         logger.info("=== Starting Dense Matching Pipeline ===")
         
-        # Select image pairs
+        # Select image pairs (and save to JSON in output directory)
+        # Always save under output directory, extract filename only for safety
+        filename = Path(pairs_file).name  # Extract just the filename part
+        save_pairs_path = str(self.output_dir / filename)
+        logger.info(f"Pairs will be saved to: {save_pairs_path}")
+            
         pairs = self.select_image_pairs(
             min_common_points=min_common_points,
             min_baseline=min_baseline,
             max_baseline=max_baseline,
-            max_pairs_per_image=max_pairs_per_image
+            max_pairs_per_image=max_pairs_per_image,
+            save_pairs_file=save_pairs_path
         )
         
         if not pairs:
@@ -624,9 +723,13 @@ class DenseMatchingPipeline:
         # Process each pair
         point_clouds = []
         total_start_time = time.time()
+        total_pairs = len(pairs)
         
         for i, (img_id1, img_id2, metadata) in enumerate(pairs):
             try:
+                img_name1 = self.colmap_dataset.images[img_id1].name
+                img_name2 = self.colmap_dataset.images[img_id2].name
+                logger.info(f"\n=== Processing pair {i+1}/{total_pairs}: {img_id1} ({img_name1}) <-> {img_id2} ({img_name2}) ===")
                 pcd = self.process_pair(img_id1, img_id2, i, use_bbox_filter=use_bbox_filter, max_points=max_points)
                 if len(pcd.points) > 0:
                     point_clouds.append(pcd)
@@ -696,12 +799,16 @@ def main():
                        help="Maximum pairs per image (duplicates automatically removed)")
     parser.add_argument("--max_points", type=int, default=100000,
                        help="Maximum number of points to triangulate per pair")
+    parser.add_argument("--pairs_file", type=str, default="pairs.json",
+                       help="Filename to save pairs information as JSON in output directory (default: pairs.json)")
     parser.add_argument("--disable_bbox_filter", action="store_true",
                        help="Disable bounding box filtering of point clouds")
     parser.add_argument("--min_triangulation_angle", type=float, default=2.0,
                        help="Minimum triangulation angle in degrees for point filtering (default: 2.0)")
     parser.add_argument("--disable_visualizations", action="store_true",
                        help="Disable saving of match visualizations to save space and speed")
+    parser.add_argument("--disable_prescaling", action="store_true",
+                       help="Disable image pre-scaling for tiny_roma model (slower but uses less disk space)")
     
     args = parser.parse_args()
     
@@ -722,7 +829,8 @@ def main():
         model_type=args.model_type,
         resolution=tuple(args.resolution),
         min_triangulation_angle=args.min_triangulation_angle,
-        save_visualizations=not args.disable_visualizations
+        save_visualizations=not args.disable_visualizations,
+        enable_prescaling=not args.disable_prescaling
     )
     
     # Run pipeline
@@ -732,7 +840,8 @@ def main():
         max_baseline=args.max_baseline,
         max_pairs_per_image=args.max_pairs_per_image,
         use_bbox_filter=not args.disable_bbox_filter,
-        max_points=args.max_points
+        max_points=args.max_points,
+        pairs_file=args.pairs_file
     )
 
 

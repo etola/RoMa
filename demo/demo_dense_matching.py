@@ -224,7 +224,7 @@ class DenseMatchingPipeline:
                  colmap_path: str,
                  images_dir: str,
                  output_dir: str,
-                 model_type: str = "roma_outdoor",
+                 model_type: str = "tiny_roma",
                  resolution: Tuple[int, int] = (864, 1152),
                  min_triangulation_angle: float = 2.0,
                  save_visualizations: bool = False,
@@ -238,7 +238,7 @@ class DenseMatchingPipeline:
             colmap_path: Path to COLMAP sparse reconstruction
             images_dir: Directory containing images
             output_dir: Output directory for results
-            model_type: RoMa model type ("roma_outdoor" or "tiny_roma")
+            model_type: RoMa model type ("tiny_roma" or "roma_outdoor")
             resolution: Target resolution for matching
             min_triangulation_angle: Minimum triangulation angle in degrees
             save_visualizations: Whether to save match visualizations (default: False)
@@ -1071,7 +1071,7 @@ class DenseMatchingPipeline:
                         cmd_parts.extend(['-i', str(self.command_args['images_dir'])])
                     if self.command_args.get('output_dir') and self.command_args['output_dir'] != str(Path(self.command_args['scene_dir']) / 'output'):
                         cmd_parts.extend(['-o', str(self.command_args['output_dir'])])
-                    if self.command_args.get('model_type') != 'roma_outdoor':
+                    if self.command_args.get('model_type') != 'tiny_roma':
                         cmd_parts.extend(['-m', str(self.command_args['model_type'])])
                     if self.command_args.get('resolution') != [864, 1152]:
                         cmd_parts.extend(['-r'] + [str(x) for x in self.command_args['resolution']])
@@ -1162,7 +1162,7 @@ def main():
                        help="Directory containing input images (default: scene_dir/images)")
     parser.add_argument("-o", "--output_dir",
                        help="Output directory for results (default: scene_dir/output, or relative to scene_dir if specified)")
-    parser.add_argument("-m", "--model_type", default="roma_outdoor",
+    parser.add_argument("-m", "--model_type", default="tiny_roma",
                        choices=["roma_outdoor", "tiny_roma"],
                        help="RoMa model type to use")
     parser.add_argument("-r", "--resolution", nargs=2, type=int, default=[864, 1152],

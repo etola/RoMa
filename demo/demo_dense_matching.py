@@ -7,9 +7,19 @@ with automatic pair selection based on COLMAP calibration data.
 Generates point clouds from matching results and merges them.
 
 Usage:
-    python demo_dense_matching.py --colmap_path /path/to/colmap/sparse/0 \
-                                  --images_dir /path/to/images \
-                                  --output_dir /path/to/output
+    # Basic usage - automatically uses scene_dir/images, scene_dir/sparse, scene_dir/output
+    python demo_dense_matching.py -s /path/to/scene
+    
+    # Or using long flags:
+    python demo_dense_matching.py --scene_dir /path/to/scene
+    
+    # Custom output directory (relative to scene_dir):
+    python demo_dense_matching.py -s /path/to/scene -o my_results
+    
+    # Override individual paths if needed:
+    python demo_dense_matching.py -s /path/to/scene \
+                                  -c /path/to/custom/colmap \
+                                  -i /path/to/custom/images
 """
 
 import os
@@ -18,7 +28,7 @@ import logging
 import tempfile
 import json
 from pathlib import Path
-from argparse import ArgumentParser
+from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
 from typing import List, Tuple, Dict, Optional
 import time
 
@@ -58,8 +68,9 @@ class DenseMatchingPipeline:
                  model_type: str = "roma_outdoor",
                  resolution: Tuple[int, int] = (864, 1152),
                  min_triangulation_angle: float = 2.0,
-                 save_visualizations: bool = True,
-                 enable_prescaling: bool = True):
+                 save_visualizations: bool = False,
+                 enable_prescaling: bool = True,
+                 command_args: Optional[Dict] = None):
         """
         Initialize dense matching pipeline.
         
@@ -70,8 +81,9 @@ class DenseMatchingPipeline:
             model_type: RoMa model type ("roma_outdoor" or "tiny_roma")
             resolution: Target resolution for matching
             min_triangulation_angle: Minimum triangulation angle in degrees
-            save_visualizations: Whether to save match visualizations
+            save_visualizations: Whether to save match visualizations (default: False)
             enable_prescaling: Pre-scale images for tiny_roma model (speeds up processing)
+            command_args: Dictionary of command line arguments used to call the program
         """
         self.colmap_path = Path(colmap_path)
         self.images_dir = Path(images_dir)
@@ -102,8 +114,20 @@ class DenseMatchingPipeline:
         
         self.model_type = model_type
         
+        # Store the actual resolution used by the model
+        if model_type == "roma_outdoor":
+            self.actual_resolution = self.roma_model.get_output_resolution()  # (H, W)
+        else:  # tiny_roma - resolution will be determined during first match
+            self.actual_resolution = None
+        
+        # Store command line arguments for summary
+        self.command_args = command_args or {}
+        
         # Storage for point clouds
         self.point_clouds = []
+        
+        # Storage for point cloud metadata (for summary)
+        self.point_cloud_metadata = []  # List of (img_id1, img_id2, point_count)
         
         # Scene bounding box (computed once)
         self.scene_bbox = None
@@ -270,6 +294,9 @@ class DenseMatchingPipeline:
                 img2_resized = Image.open(scaled_path2)
                 
                 H, W = warp.shape[:2]
+                # Store actual resolution for tiny_roma on first match
+                if self.actual_resolution is None:
+                    self.actual_resolution = (H, W)
                 logger.info(f"  Warp shape: {warp.shape}")
                 logger.info(f"  Certainty shape: {certainty.shape}")
                 logger.info(f"  Scaled image 1: {img1_resized.size}")
@@ -307,6 +334,9 @@ class DenseMatchingPipeline:
                     try:
                         warp, certainty = self.roma_model.match(tmp1.name, tmp2.name)
                         H, W = warp.shape[:2]
+                        # Store actual resolution for tiny_roma on first match
+                        if self.actual_resolution is None:
+                            self.actual_resolution = (H, W)
                         logger.info(f"  Warp shape: {warp.shape}")
                         logger.info(f"  Certainty shape: {certainty.shape}")
                         logger.info(f"  Resized image 1: {img1_resized.size}")
@@ -582,7 +612,7 @@ class DenseMatchingPipeline:
         if self.save_visualizations:
             self.save_visualization(warp, certainty, img_id1, img_id2)
         else:
-            logger.info(f"  Visualizations disabled")
+            logger.info(f"  Visualizations not enabled (use --enable_visualizations to save)")
         
         # Generate point cloud
         pcd = self.generate_point_cloud(warp, certainty, img_id1, img_id2, use_bbox_filter=use_bbox_filter, max_points=max_points)
@@ -590,7 +620,12 @@ class DenseMatchingPipeline:
         # Save individual point cloud
         pcd_path = self.output_dir / "point_clouds" / f"cloud_{img_id1}_{img_id2}.ply"
         o3d.io.write_point_cloud(str(pcd_path), pcd)
-        logger.info(f"  Saved point cloud: {pcd_path.name} ({len(pcd.points)} points)")
+        
+        # Store metadata for summary
+        point_count = len(pcd.points)
+        self.point_cloud_metadata.append((img_id1, img_id2, point_count))
+        
+        logger.info(f"  Saved point cloud: {pcd_path.name} ({point_count} points)")
         
         return pcd
     
@@ -759,60 +794,156 @@ class DenseMatchingPipeline:
             with open(summary_path, 'w') as f:
                 f.write(f"Dense Matching Results\n")
                 f.write(f"=====================\n\n")
+                
+                # Write command line arguments
+                if self.command_args:
+                    f.write(f"Command Line Used:\n")
+                    f.write(f"------------------\n")
+                    # Reconstruct command line
+                    cmd_parts = [sys.argv[0]]
+                    if self.command_args.get('scene_dir'):
+                        cmd_parts.extend(['-s', str(self.command_args['scene_dir'])])
+                    if self.command_args.get('colmap_path') and self.command_args['colmap_path'] != str(Path(self.command_args['scene_dir']) / 'sparse'):
+                        cmd_parts.extend(['-c', str(self.command_args['colmap_path'])])
+                    if self.command_args.get('images_dir') and self.command_args['images_dir'] != str(Path(self.command_args['scene_dir']) / 'images'):
+                        cmd_parts.extend(['-i', str(self.command_args['images_dir'])])
+                    if self.command_args.get('output_dir') and self.command_args['output_dir'] != str(Path(self.command_args['scene_dir']) / 'output'):
+                        cmd_parts.extend(['-o', str(self.command_args['output_dir'])])
+                    if self.command_args.get('model_type') != 'roma_outdoor':
+                        cmd_parts.extend(['-m', str(self.command_args['model_type'])])
+                    if self.command_args.get('resolution') != [864, 1152]:
+                        cmd_parts.extend(['-r'] + [str(x) for x in self.command_args['resolution']])
+                    if self.command_args.get('enable_visualizations'):
+                        cmd_parts.append('-v')
+                    if self.command_args.get('disable_prescaling'):
+                        cmd_parts.append('-S')
+                    # Add other non-default parameters
+                    for param in ['min_common_points', 'min_baseline', 'max_baseline', 'max_pairs_per_image', 'max_points', 'min_triangulation_angle']:
+                        if param in self.command_args:
+                            value = self.command_args[param]
+                            defaults = {'min_common_points': 100, 'min_baseline': 0.1, 'max_baseline': 2.0, 
+                                      'max_pairs_per_image': 5, 'max_points': 100000, 'min_triangulation_angle': 2.0}
+                            if value != defaults.get(param):
+                                flag_map = {'min_common_points': '-p', 'min_baseline': '-b', 'max_baseline': '-B',
+                                          'max_pairs_per_image': '-n', 'max_points': '-P', 'min_triangulation_angle': '-a'}
+                                cmd_parts.extend([flag_map[param], str(value)])
+                    
+                    f.write(f"  {' '.join(cmd_parts)}\n\n")
+                    
+                    f.write(f"All Arguments:\n")
+                    f.write(f"--------------\n")
+                    for key, value in self.command_args.items():
+                        f.write(f"  {key}: {value}\n")
+                    f.write(f"\n")
+                
+                f.write(f"Processed Paths:\n")
+                f.write(f"----------------\n")
                 f.write(f"Input COLMAP path: {self.colmap_path}\n")
                 f.write(f"Input images dir: {self.images_dir}\n")
                 f.write(f"Output directory: {self.output_dir}\n")
                 f.write(f"Model type: {self.model_type}\n")
-                f.write(f"Resolution: {self.resolution}\n\n")
+                f.write(f"Input resolution parameter: {self.resolution}\n")
+                if self.actual_resolution:
+                    f.write(f"Actual model resolution: {self.actual_resolution} (H, W)\n")
+                else:
+                    f.write(f"Actual model resolution: Not determined yet\n")
+                f.write(f"\n")
                 f.write(f"Processed {len(point_clouds)} image pairs\n")
                 f.write(f"Final point cloud: {len(merged_pcd.points)} points\n")
                 f.write(f"Total processing time: {total_time:.2f}s\n\n")
                 f.write(f"Image pairs processed:\n")
-                for i, (id1, id2, meta) in enumerate(pairs[:len(point_clouds)]):
-                    name1 = self.colmap_dataset.images[id1].name
-                    name2 = self.colmap_dataset.images[id2].name
-                    f.write(f"  {i+1}. {name1} <-> {name2}\n")
+                for i, (img_id1, img_id2, point_count) in enumerate(self.point_cloud_metadata):
+                    name1 = self.colmap_dataset.images[img_id1].name
+                    name2 = self.colmap_dataset.images[img_id2].name
+                    f.write(f"  {i+1}. {name1} <-> {name2} {point_count}\n")
         else:
             logger.error("No point clouds generated!")
 
 
 def main():
-    parser = ArgumentParser(description="Dense matching with RoMa and COLMAP integration")
-    parser.add_argument("--colmap_path", required=True, 
-                       help="Path to COLMAP sparse reconstruction directory")
-    parser.add_argument("--images_dir", required=True,
-                       help="Directory containing input images")
-    parser.add_argument("--output_dir", required=True,
-                       help="Output directory for results")
-    parser.add_argument("--model_type", default="roma_outdoor",
+    parser = ArgumentParser(description="Dense matching with RoMa and COLMAP integration",
+                          formatter_class=ArgumentDefaultsHelpFormatter)
+    parser.add_argument("-s", "--scene_dir", required=True, 
+                       help="Main scene directory containing images/ and sparse/ subdirectories")
+    parser.add_argument("-c", "--colmap_path", 
+                       help="Path to COLMAP sparse reconstruction directory (default: auto-detect scene_dir/sparse/0 or scene_dir/sparse)")
+    parser.add_argument("-i", "--images_dir",
+                       help="Directory containing input images (default: scene_dir/images)")
+    parser.add_argument("-o", "--output_dir",
+                       help="Output directory for results (default: scene_dir/output, or relative to scene_dir if specified)")
+    parser.add_argument("-m", "--model_type", default="roma_outdoor",
                        choices=["roma_outdoor", "tiny_roma"],
                        help="RoMa model type to use")
-    parser.add_argument("--resolution", nargs=2, type=int, default=[864, 1152],
+    parser.add_argument("-r", "--resolution", nargs=2, type=int, default=[864, 1152],
                        help="Target resolution for matching [height width]")
-    parser.add_argument("--min_common_points", type=int, default=100,
+    parser.add_argument("-p", "--min_common_points", type=int, default=100,
                        help="Minimum common 3D points for pair selection")
-    parser.add_argument("--min_baseline", type=float, default=0.1,
+    parser.add_argument("-b", "--min_baseline", type=float, default=0.1,
                        help="Minimum baseline distance for pair selection")
-    parser.add_argument("--max_baseline", type=float, default=2.0,
+    parser.add_argument("-B", "--max_baseline", type=float, default=2.0,
                        help="Maximum baseline distance for pair selection")
-    parser.add_argument("--max_pairs_per_image", type=int, default=5,
+    parser.add_argument("-n", "--max_pairs_per_image", type=int, default=5,
                        help="Maximum pairs per image (duplicates automatically removed)")
-    parser.add_argument("--max_points", type=int, default=100000,
+    parser.add_argument("-P", "--max_points", type=int, default=100000,
                        help="Maximum number of points to triangulate per pair")
-    parser.add_argument("--pairs_file", type=str, default="pairs.json",
+    parser.add_argument("-f", "--pairs_file", type=str, default="pairs.json",
                        help="Filename to save pairs information as JSON in output directory (default: pairs.json)")
-    parser.add_argument("--disable_bbox_filter", action="store_true",
+    parser.add_argument("-d", "--disable_bbox_filter", action="store_true",
                        help="Disable bounding box filtering of point clouds")
-    parser.add_argument("--min_triangulation_angle", type=float, default=2.0,
+    parser.add_argument("-a", "--min_triangulation_angle", type=float, default=2.0,
                        help="Minimum triangulation angle in degrees for point filtering (default: 2.0)")
-    parser.add_argument("--disable_visualizations", action="store_true",
-                       help="Disable saving of match visualizations to save space and speed")
-    parser.add_argument("--disable_prescaling", action="store_true",
+    parser.add_argument("-v", "--enable_visualizations", action="store_true",
+                       help="Enable saving of match visualizations")
+    parser.add_argument("-S", "--disable_prescaling", action="store_true",
                        help="Disable image pre-scaling for tiny_roma model (slower but uses less disk space)")
     
     args = parser.parse_args()
     
+    # Derive paths from scene_dir
+    scene_dir = Path(args.scene_dir)
+    
+    # Set default paths relative to scene_dir if not provided
+    if not args.colmap_path:
+        # Try common COLMAP sparse directory patterns
+        sparse_candidates = [
+            scene_dir / "sparse" / "0",  # Most common: sparse/0
+            scene_dir / "sparse",        # Direct sparse folder
+            scene_dir / "colmap" / "sparse" / "0",  # Alternative structure
+            scene_dir / "colmap" / "sparse"
+        ]
+        
+        # Use the first existing candidate
+        sparse_found = False
+        for candidate in sparse_candidates:
+            if candidate.exists() and candidate.is_dir():
+                args.colmap_path = str(candidate)
+                sparse_found = True
+                break
+        
+        if not sparse_found:
+            args.colmap_path = str(scene_dir / "sparse")  # Default fallback
+    
+    if not args.images_dir:
+        args.images_dir = str(scene_dir / "images")
+    
+    if not args.output_dir:
+        args.output_dir = str(scene_dir / "output")
+    else:
+        # If output_dir is provided, make it relative to scene_dir
+        if not Path(args.output_dir).is_absolute():
+            args.output_dir = str(scene_dir / args.output_dir)
+    
+    # Log the derived paths
+    logger.info(f"Scene directory: {scene_dir}")
+    logger.info(f"COLMAP path: {args.colmap_path}")
+    logger.info(f"Images directory: {args.images_dir}")
+    logger.info(f"Output directory: {args.output_dir}")
+    
     # Validate inputs
+    if not scene_dir.exists():
+        logger.error(f"Scene directory does not exist: {scene_dir}")
+        return
+    
     if not Path(args.colmap_path).exists():
         logger.error(f"COLMAP path does not exist: {args.colmap_path}")
         return
@@ -820,6 +951,26 @@ def main():
     if not Path(args.images_dir).exists():
         logger.error(f"Images directory does not exist: {args.images_dir}")
         return
+    
+    # Convert args to dictionary for saving to summary
+    command_args = {
+        'scene_dir': args.scene_dir,
+        'colmap_path': args.colmap_path,
+        'images_dir': args.images_dir,
+        'output_dir': args.output_dir,
+        'model_type': args.model_type,
+        'resolution': args.resolution,
+        'min_common_points': args.min_common_points,
+        'min_baseline': args.min_baseline,
+        'max_baseline': args.max_baseline,
+        'max_pairs_per_image': args.max_pairs_per_image,
+        'max_points': args.max_points,
+        'pairs_file': args.pairs_file,
+        'disable_bbox_filter': args.disable_bbox_filter,
+        'min_triangulation_angle': args.min_triangulation_angle,
+        'enable_visualizations': args.enable_visualizations,
+        'disable_prescaling': args.disable_prescaling
+    }
     
     # Create pipeline
     pipeline = DenseMatchingPipeline(
@@ -829,8 +980,9 @@ def main():
         model_type=args.model_type,
         resolution=tuple(args.resolution),
         min_triangulation_angle=args.min_triangulation_angle,
-        save_visualizations=not args.disable_visualizations,
-        enable_prescaling=not args.disable_prescaling
+        save_visualizations=args.enable_visualizations,
+        enable_prescaling=not args.disable_prescaling,
+        command_args=command_args
     )
     
     # Run pipeline

@@ -13,9 +13,13 @@ logger = logging.getLogger(__name__)
 
 
 class COLMAPDataset:
-    """Handler for COLMAP reconstruction data."""
+    """
+    Handler for COLMAP reconstruction data.
     
-    def __init__(self, colmap_path: str):
+    Includes caching of visible 3D points per image for faster point queries.
+    """
+    
+    def __init__(self, colmap_path: str, build_cache: bool = True):
         """
         Initialize COLMAP dataset.
         
@@ -24,14 +28,21 @@ class COLMAPDataset:
                 - cameras.bin/cameras.txt
                 - images.bin/images.txt  
                 - points3D.bin/points3D.txt
+            build_cache: Whether to build visible points cache during initialization (default: True)
         """
         self.colmap_path = Path(colmap_path)
         self.reconstruction = None
         self.images = {}
         self.cameras = {}
         self.points3d = {}
+        # Cache for visible 3D points per image (for performance)
+        self._visible_points_cache = {}
+        self._cache_built = False
         
         self._load_reconstruction()
+        # Build cache during initialization for better performance
+        if build_cache:
+            self._build_visible_points_cache()
     
     def _load_reconstruction(self):
         """Load COLMAP reconstruction from binary or text files."""
@@ -50,6 +61,39 @@ class COLMAPDataset:
         self.points3d = dict(self.reconstruction.points3D)
         
         logger.info(f"Loaded {len(self.images)} images, {len(self.cameras)} cameras, {len(self.points3d)} 3D points")
+    
+    def _build_visible_points_cache(self):
+        """Build cache of visible 3D point IDs for each image."""
+        logger.info("Building visible points cache for faster point queries...")
+        
+        self._visible_points_cache = {}
+        
+        for img_id, image in self.images.items():
+            visible_points = set()
+            for point2d in image.points2D:
+                if point2d.has_point3D():
+                    visible_points.add(point2d.point3D_id)
+            self._visible_points_cache[img_id] = visible_points
+        
+        self._cache_built = True
+        logger.info(f"Built visible points cache for {len(self.images)} images")
+    
+    def _get_visible_points(self, img_id: int) -> set:
+        """Get cached visible 3D point IDs for an image."""
+        if not self._cache_built:
+            self._build_visible_points_cache()
+        return self._visible_points_cache.get(img_id, set())
+    
+    def clear_cache(self):
+        """Clear the visible points cache to free memory."""
+        self._visible_points_cache.clear()
+        self._cache_built = False
+        logger.info("Cleared visible points cache")
+    
+    def rebuild_cache(self):
+        """Rebuild the visible points cache (useful if data has changed)."""
+        self.clear_cache()
+        self._build_visible_points_cache()
     
     def get_image_by_name(self, name: str) -> Optional[pycolmap.Image]:
         """Get image by filename."""
@@ -125,21 +169,19 @@ class COLMAPDataset:
     
     def get_common_points(self, img_id1: int, img_id2: int) -> List[int]:
         """Get 3D point IDs visible in both images."""
-        img1 = self.images[img_id1]
-        img2 = self.images[img_id2]
-        
-        # Get valid 3D point IDs from points2D observations
-        points1 = set()
-        for point2d in img1.points2D:
-            if point2d.has_point3D():
-                points1.add(point2d.point3D_id)
-        
-        points2 = set()
-        for point2d in img2.points2D:
-            if point2d.has_point3D():
-                points2.add(point2d.point3D_id)
+        # Use cached visible points for much faster lookup
+        points1 = self._get_visible_points(img_id1)
+        points2 = self._get_visible_points(img_id2)
         
         return list(points1.intersection(points2))
+    
+    def get_num_visible_points(self, img_id: int) -> int:
+        """Get number of visible 3D points in an image."""
+        return len(self._get_visible_points(img_id))
+    
+    def get_visible_points_list(self, img_id: int) -> List[int]:
+        """Get list of visible 3D point IDs in an image."""
+        return list(self._get_visible_points(img_id))
     
     def compute_baseline(self, img_id1: int, img_id2: int) -> float:
         """Compute baseline distance between two cameras."""

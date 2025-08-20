@@ -31,6 +31,8 @@ from pathlib import Path
 from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
 from typing import List, Tuple, Dict, Optional
 import time
+from collections import defaultdict
+from contextlib import contextmanager
 
 import numpy as np
 import torch
@@ -56,6 +58,69 @@ if torch.backends.mps.is_available():
     device = torch.device('mps')
 
 logger.info(f"Using device: {device}")
+
+
+class Profiler:
+    """Simple profiler to track time spent in different operations."""
+    
+    def __init__(self):
+        self.timings = defaultdict(list)
+        self.current_timers = {}
+    
+    @contextmanager
+    def profile(self, operation_name: str):
+        """Context manager to time an operation."""
+        start_time = time.time()
+        try:
+            yield
+        finally:
+            end_time = time.time()
+            duration = end_time - start_time
+            self.timings[operation_name].append(duration)
+    
+    def get_summary(self) -> Dict[str, Dict[str, float]]:
+        """Get timing summary statistics."""
+        summary = {}
+        for operation, times in self.timings.items():
+            if times:
+                summary[operation] = {
+                    'total_time': sum(times),
+                    'average_time': sum(times) / len(times),
+                    'count': len(times),
+                    'min_time': min(times),
+                    'max_time': max(times)
+                }
+        return summary
+    
+    def print_summary(self):
+        """Print a formatted timing summary."""
+        summary = self.get_summary()
+        if not summary:
+            logger.info("No profiling data available")
+            return
+        
+        logger.info("\n" + "="*60)
+        logger.info("PERFORMANCE PROFILING SUMMARY")
+        logger.info("="*60)
+        
+        # Sort by total time (descending)
+        sorted_ops = sorted(summary.items(), key=lambda x: x[1]['total_time'], reverse=True)
+        
+        for operation, stats in sorted_ops:
+            logger.info(f"\n{operation}:")
+            logger.info(f"  Total time: {stats['total_time']:.3f}s")
+            logger.info(f"  Average time: {stats['average_time']:.3f}s")
+            logger.info(f"  Count: {stats['count']}")
+            if stats['count'] > 1:
+                logger.info(f"  Min/Max: {stats['min_time']:.3f}s / {stats['max_time']:.3f}s")
+        
+        logger.info("="*60)
+    
+    def save_to_file(self, filepath: str):
+        """Save profiling results to JSON file."""
+        summary = self.get_summary()
+        with open(filepath, 'w') as f:
+            json.dump(summary, f, indent=2)
 
 
 class DenseMatchingPipeline:
@@ -128,6 +193,9 @@ class DenseMatchingPipeline:
         
         # Storage for point cloud metadata (for summary)
         self.point_cloud_metadata = []  # List of (img_id1, img_id2, point_count)
+        
+        # Performance profiler
+        self.profiler = Profiler()
         
         # Scene bounding box (computed once)
         self.scene_bbox = None
@@ -270,12 +338,14 @@ class DenseMatchingPipeline:
         start_time = time.time()
         
         if self.model_type == "roma_outdoor":
-            H, W = self.roma_model.get_output_resolution()
-            img1 = Image.open(img_path1).resize((W, H))
-            img2 = Image.open(img_path2).resize((W, H))
+            with self.profiler.profile("image_loading_and_resize"):
+                H, W = self.roma_model.get_output_resolution()
+                img1 = Image.open(img_path1).resize((W, H))
+                img2 = Image.open(img_path2).resize((W, H))
             
             # Perform matching
-            warp, certainty = self.roma_model.match(str(img_path1), str(img_path2), device=device)
+            with self.profiler.profile("roma_model_inference"):
+                warp, certainty = self.roma_model.match(str(img_path1), str(img_path2), device=device)
             
         else:  # tiny_roma
             # Use pre-scaled images if available, otherwise resize on the fly
@@ -287,11 +357,13 @@ class DenseMatchingPipeline:
             if (self.enable_prescaling and scaled_path1.exists() and scaled_path2.exists()):
                 # Use pre-scaled images - much faster!
                 logger.info(f"  Using pre-scaled images from {self.scaled_images_dir.name}/")
-                warp, certainty = self.roma_model.match(str(scaled_path1), str(scaled_path2))
+                with self.profiler.profile("tiny_roma_model_inference"):
+                    warp, certainty = self.roma_model.match(str(scaled_path1), str(scaled_path2))
                 
                 # Load scaled images to get their sizes for logging
-                img1_resized = Image.open(scaled_path1)
-                img2_resized = Image.open(scaled_path2)
+                with self.profiler.profile("image_loading_tiny_roma"):
+                    img1_resized = Image.open(scaled_path1)
+                    img2_resized = Image.open(scaled_path2)
                 
                 H, W = warp.shape[:2]
                 # Store actual resolution for tiny_roma on first match
@@ -307,22 +379,23 @@ class DenseMatchingPipeline:
                 logger.warning(f"  Pre-scaled images not found, resizing on the fly...")
                 max_size = 800  # Limit maximum dimension to control memory usage
                 
-                img1 = Image.open(img_path1)
-                img2 = Image.open(img_path2)
-                
-                # Resize while maintaining aspect ratio
-                def resize_with_max_size(img, max_size):
-                    w, h = img.size
-                    if max(w, h) > max_size:
-                        if w > h:
-                            new_w, new_h = max_size, int(h * max_size / w)
-                        else:
-                            new_w, new_h = int(w * max_size / h), max_size
-                        return img.resize((new_w, new_h))
-                    return img
-                
-                img1_resized = resize_with_max_size(img1, max_size)
-                img2_resized = resize_with_max_size(img2, max_size)
+                with self.profiler.profile("image_loading_and_resize_fallback"):
+                    img1 = Image.open(img_path1)
+                    img2 = Image.open(img_path2)
+                    
+                    # Resize while maintaining aspect ratio
+                    def resize_with_max_size(img, max_size):
+                        w, h = img.size
+                        if max(w, h) > max_size:
+                            if w > h:
+                                new_w, new_h = max_size, int(h * max_size / w)
+                            else:
+                                new_w, new_h = int(w * max_size / h), max_size
+                            return img.resize((new_w, new_h))
+                        return img
+                    
+                    img1_resized = resize_with_max_size(img1, max_size)
+                    img2_resized = resize_with_max_size(img2, max_size)
                 
                 # Save temporarily and match
                 import tempfile
@@ -332,7 +405,8 @@ class DenseMatchingPipeline:
                     img2_resized.save(tmp2.name)
                     
                     try:
-                        warp, certainty = self.roma_model.match(tmp1.name, tmp2.name)
+                        with self.profiler.profile("tiny_roma_model_inference_fallback"):
+                            warp, certainty = self.roma_model.match(tmp1.name, tmp2.name)
                         H, W = warp.shape[:2]
                         # Store actual resolution for tiny_roma on first match
                         if self.actual_resolution is None:
@@ -403,11 +477,12 @@ class DenseMatchingPipeline:
         logger.info(f"Generating point cloud for pair {img_id1}-{img_id2}")
         
         # Get camera information
-        info1 = self.colmap_dataset.get_image_info(img_id1)
-        info2 = self.colmap_dataset.get_image_info(img_id2)
-        
-        K1, K2 = info1['K'], info2['K']
-        R_rel, t_rel = self.colmap_dataset.get_relative_pose(img_id1, img_id2)
+        with self.profiler.profile("camera_info_retrieval"):
+            info1 = self.colmap_dataset.get_image_info(img_id1)
+            info2 = self.colmap_dataset.get_image_info(img_id2)
+            
+            K1, K2 = info1['K'], info2['K']
+            R_rel, t_rel = self.colmap_dataset.get_relative_pose(img_id1, img_id2)
         
         # Get camera centers for verification
         cam_center1 = self.colmap_dataset.images[img_id1].projection_center()
@@ -418,124 +493,135 @@ class DenseMatchingPipeline:
         logger.info(f"  Baseline: {baseline_actual:.3f}m")
         
         # Load original images for colors
-        img_path1 = self.colmap_dataset.get_image_path(img_id1, self.images_dir)
-        img_path2 = self.colmap_dataset.get_image_path(img_id2, self.images_dir)
-        
-        img1 = Image.open(img_path1)
-        img2 = Image.open(img_path2)
-        
-        # Get original image sizes
-        orig_w1, orig_h1 = img1.size
-        orig_w2, orig_h2 = img2.size
-        
-        # Get warp resolution and ensure images match exactly
-        H, W = warp.shape[:2]
-        # For tiny roma, ensure we resize to match warp output exactly
-        img1_resized = img1.resize((W, H), Image.LANCZOS)
-        img2_resized = img2.resize((W, H), Image.LANCZOS)
-        
-        # Convert to numpy
-        img1_np = np.array(img1_resized) / 255.0
-        img2_np = np.array(img2_resized) / 255.0
+        with self.profiler.profile("image_loading_for_colors"):
+            img_path1 = self.colmap_dataset.get_image_path(img_id1, self.images_dir)
+            img_path2 = self.colmap_dataset.get_image_path(img_id2, self.images_dir)
+            
+            img1 = Image.open(img_path1)
+            img2 = Image.open(img_path2)
+            
+            # Get original image sizes
+            orig_w1, orig_h1 = img1.size
+            orig_w2, orig_h2 = img2.size
+            
+            # Get warp resolution and ensure images match exactly
+            H, W = warp.shape[:2]
+            # For tiny roma, ensure we resize to match warp output exactly
+            img1_resized = img1.resize((W, H), Image.LANCZOS)
+            img2_resized = img2.resize((W, H), Image.LANCZOS)
+            
+            # Convert to numpy
+            img1_np = np.array(img1_resized) / 255.0
+            img2_np = np.array(img2_resized) / 255.0
         
         # Sample high-certainty correspondences
-        mask = certainty > certainty_threshold
-        valid_indices = torch.nonzero(mask, as_tuple=False)
-        
-        if len(valid_indices) > max_points:
-            # Randomly sample points
-            perm = torch.randperm(len(valid_indices))[:max_points]
-            valid_indices = valid_indices[perm]
-        
-        logger.info(f"  Triangulating {len(valid_indices)} points")
-        
-        # Extract correspondences
-        y_coords, x_coords = valid_indices[:, 0], valid_indices[:, 1]
-        
-        # Points in image 1 (pixel coordinates)
-        kpts1 = torch.stack([x_coords, y_coords], dim=1).float()
-        
-        # Corresponding points in image 2 from warp
-        warp_coords = warp[y_coords, x_coords, 2:4]  # Get the second image coordinates
-        
-        # Convert from normalized coordinates to pixel coordinates
-        kpts2_x = W * (warp_coords[:, 0] + 1) / 2
-        kpts2_y = H * (warp_coords[:, 1] + 1) / 2
-        kpts2 = torch.stack([kpts2_x, kpts2_y], dim=1)
-        
-        # Convert to numpy
-        kpts1_np = kpts1.cpu().numpy()
-        kpts2_np = kpts2.cpu().numpy()
+        with self.profiler.profile("correspondence_extraction"):
+            mask = certainty > certainty_threshold
+            valid_indices = torch.nonzero(mask, as_tuple=False)
+            
+            if len(valid_indices) > max_points:
+                # Randomly sample points
+                perm = torch.randperm(len(valid_indices))[:max_points]
+                valid_indices = valid_indices[perm]
+            
+            logger.info(f"  Triangulating {len(valid_indices)} points")
+            
+            # Extract correspondences
+            y_coords, x_coords = valid_indices[:, 0], valid_indices[:, 1]
+            
+            # Points in image 1 (pixel coordinates)
+            kpts1 = torch.stack([x_coords, y_coords], dim=1).float()
+            
+            # Corresponding points in image 2 from warp
+            warp_coords = warp[y_coords, x_coords, 2:4]  # Get the second image coordinates
+            
+            # Convert from normalized coordinates to pixel coordinates
+            kpts2_x = W * (warp_coords[:, 0] + 1) / 2
+            kpts2_y = H * (warp_coords[:, 1] + 1) / 2
+            kpts2 = torch.stack([kpts2_x, kpts2_y], dim=1)
+            
+            # Convert to numpy
+            kpts1_np = kpts1.cpu().numpy()
+            kpts2_np = kpts2.cpu().numpy()
         
         # Adjust camera matrices for resized images
-        # Scale factors from original image size to warp resolution
-        scale_x1, scale_y1 = W / orig_w1, H / orig_h1
-        scale_x2, scale_y2 = W / orig_w2, H / orig_h2
-        
-        K1_scaled = K1.copy()
-        K1_scaled[0, 0] *= scale_x1  # fx
-        K1_scaled[1, 1] *= scale_y1  # fy
-        K1_scaled[0, 2] *= scale_x1  # cx
-        K1_scaled[1, 2] *= scale_y1  # cy
-        
-        K2_scaled = K2.copy()
-        K2_scaled[0, 0] *= scale_x2  # fx
-        K2_scaled[1, 1] *= scale_y2  # fy
-        K2_scaled[0, 2] *= scale_x2  # cx
-        K2_scaled[1, 2] *= scale_y2  # cy
+        with self.profiler.profile("camera_matrix_scaling"):
+            # Scale factors from original image size to warp resolution
+            scale_x1, scale_y1 = W / orig_w1, H / orig_h1
+            scale_x2, scale_y2 = W / orig_w2, H / orig_h2
+            
+            K1_scaled = K1.copy()
+            K1_scaled[0, 0] *= scale_x1  # fx
+            K1_scaled[1, 1] *= scale_y1  # fy
+            K1_scaled[0, 2] *= scale_x1  # cx
+            K1_scaled[1, 2] *= scale_y1  # cy
+            
+            K2_scaled = K2.copy()
+            K2_scaled[0, 0] *= scale_x2  # fx
+            K2_scaled[1, 1] *= scale_y2  # fy
+            K2_scaled[0, 2] *= scale_x2  # cx
+            K2_scaled[1, 2] *= scale_y2  # cy
         
         # Triangulate 3D points
-        points_3d = triangulate_points(kpts1_np, kpts2_np, K1_scaled, K2_scaled, R_rel, t_rel)
+        with self.profiler.profile("triangulation"):
+            points_3d = triangulate_points(kpts1_np, kpts2_np, K1_scaled, K2_scaled, R_rel, t_rel)
         
         # Transform points from camera 1 coordinate system to world coordinates
-        R1, t1 = self.colmap_dataset.get_pose(img_id1)
-        # COLMAP uses cam_from_world: X_cam = R @ X_world + t
-        # So to transform from camera to world: X_world = R^T @ (X_cam - t)
-        t1_flat = t1.flatten()  # Ensure t1 is 1D for broadcasting
-        points_3d_world = (R1.T @ (points_3d - t1_flat).T).T
-        
-        # Use world coordinates for further processing
-        points_3d = points_3d_world
+        with self.profiler.profile("coordinate_transformation"):
+            R1, t1 = self.colmap_dataset.get_pose(img_id1)
+            # COLMAP uses cam_from_world: X_cam = R @ X_world + t
+            # So to transform from camera to world: X_world = R^T @ (X_cam - t)
+            t1_flat = t1.flatten()  # Ensure t1 is 1D for broadcasting
+            points_3d_world = (R1.T @ (points_3d - t1_flat).T).T
+            
+            # Use world coordinates for further processing
+            points_3d = points_3d_world
         
         logger.info(f"  Point cloud center: [{np.mean(points_3d, axis=0)[0]:.3f}, {np.mean(points_3d, axis=0)[1]:.3f}, {np.mean(points_3d, axis=0)[2]:.3f}]")
         
         # Get colors from image 1
-        colors = img1_np[y_coords.cpu().numpy(), x_coords.cpu().numpy()]
+        with self.profiler.profile("color_extraction"):
+            colors = img1_np[y_coords.cpu().numpy(), x_coords.cpu().numpy()]
         
         # Filter out points that are too close or too far (using world coordinates)
-        depths = np.linalg.norm(points_3d, axis=1)
-        valid_depth_mask = (depths > 0.1) & (depths < 100)
-        
-        points_3d = points_3d[valid_depth_mask]
-        colors = colors[valid_depth_mask]
-        
-        logger.info(f"  After depth filtering: {len(points_3d)} points")
+        with self.profiler.profile("depth_filtering"):
+            depths = np.linalg.norm(points_3d, axis=1)
+            valid_depth_mask = (depths > 0.1) & (depths < 100)
+            
+            points_3d = points_3d[valid_depth_mask]
+            colors = colors[valid_depth_mask]
+            
+            logger.info(f"  After depth filtering: {len(points_3d)} points")
         
         # Filter points by triangulation angle (remove points with small viewing angles)
-        points_3d, colors = self.filter_by_triangulation_angle(
-            points_3d, colors, cam_center1, cam_center2, min_angle_degrees=self.min_triangulation_angle
-        )
+        with self.profiler.profile("triangulation_angle_filtering"):
+            points_3d, colors = self.filter_by_triangulation_angle(
+                points_3d, colors, cam_center1, cam_center2, min_angle_degrees=self.min_triangulation_angle
+            )
         
         # Optional: Filter by scene bounding box
         if use_bbox_filter and len(points_3d) > 0:
-            scene_bbox = self.compute_scene_bounding_box()
-            if scene_bbox is not None:
-                filtered_points, bbox_mask = self.colmap_dataset.filter_points_by_bbox(points_3d, scene_bbox)
-                filtered_colors = colors[bbox_mask]
-                
-                logger.info(f"  Bounding box filter: {len(filtered_points)}/{len(points_3d)} points retained")
-                points_3d = filtered_points
-                colors = filtered_colors
+            with self.profiler.profile("bounding_box_filtering"):
+                scene_bbox = self.compute_scene_bounding_box()
+                if scene_bbox is not None:
+                    filtered_points, bbox_mask = self.colmap_dataset.filter_points_by_bbox(points_3d, scene_bbox)
+                    filtered_colors = colors[bbox_mask]
+                    
+                    logger.info(f"  Bounding box filter: {len(filtered_points)}/{len(points_3d)} points retained")
+                    points_3d = filtered_points
+                    colors = filtered_colors
         
         logger.info(f"  Final point cloud: {len(points_3d)} points")
         
         # Create Open3D point cloud
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(points_3d)
-        pcd.colors = o3d.utility.Vector3dVector(colors)
+        with self.profiler.profile("point_cloud_creation"):
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(points_3d)
+            pcd.colors = o3d.utility.Vector3dVector(colors)
         
         # Remove statistical outliers
-        pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+        with self.profiler.profile("outlier_removal"):
+            pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
         
         return pcd
     
@@ -742,14 +828,15 @@ class DenseMatchingPipeline:
         filename = Path(pairs_file).name  # Extract just the filename part
         save_pairs_path = str(self.output_dir / filename)
         logger.info(f"Pairs will be saved to: {save_pairs_path}")
-            
-        pairs = self.select_image_pairs(
-            min_common_points=min_common_points,
-            min_baseline=min_baseline,
-            max_baseline=max_baseline,
-            max_pairs_per_image=max_pairs_per_image,
-            save_pairs_file=save_pairs_path
-        )
+        
+        with self.profiler.profile("pair_selection"):
+            pairs = self.select_image_pairs(
+                min_common_points=min_common_points,
+                min_baseline=min_baseline,
+                max_baseline=max_baseline,
+                max_pairs_per_image=max_pairs_per_image,
+                save_pairs_file=save_pairs_path
+            )
         
         if not pairs:
             logger.error("No suitable image pairs found!")
@@ -765,7 +852,10 @@ class DenseMatchingPipeline:
                 img_name1 = self.colmap_dataset.images[img_id1].name
                 img_name2 = self.colmap_dataset.images[img_id2].name
                 logger.info(f"\n=== Processing pair {i+1}/{total_pairs}: {img_id1} ({img_name1}) <-> {img_id2} ({img_name2}) ===")
-                pcd = self.process_pair(img_id1, img_id2, i, use_bbox_filter=use_bbox_filter, max_points=max_points)
+                
+                with self.profiler.profile("process_single_pair"):
+                    pcd = self.process_pair(img_id1, img_id2, i, use_bbox_filter=use_bbox_filter, max_points=max_points)
+                
                 if len(pcd.points) > 0:
                     point_clouds.append(pcd)
                 else:
@@ -776,7 +866,8 @@ class DenseMatchingPipeline:
         
         # Merge point clouds
         if point_clouds:
-            merged_pcd = self.merge_point_clouds(point_clouds)
+            with self.profiler.profile("merge_point_clouds"):
+                merged_pcd = self.merge_point_clouds(point_clouds)
             
             # Save merged point cloud
             merged_path = self.output_dir / "merged_point_cloud.ply"
@@ -788,6 +879,14 @@ class DenseMatchingPipeline:
             logger.info(f"Processed {len(point_clouds)} pairs successfully")
             logger.info(f"Final merged point cloud: {len(merged_pcd.points)} points")
             logger.info(f"Saved to: {merged_path}")
+            
+            # Print profiling summary
+            self.profiler.print_summary()
+            
+            # Save detailed profiling data to JSON
+            profiling_path = self.output_dir / "profiling_data.json"
+            self.profiler.save_to_file(str(profiling_path))
+            logger.info(f"Saved detailed profiling data to: {profiling_path}")
             
             # Save processing summary
             summary_path = self.output_dir / "processing_summary.txt"
@@ -851,6 +950,25 @@ class DenseMatchingPipeline:
                 f.write(f"Processed {len(point_clouds)} image pairs\n")
                 f.write(f"Final point cloud: {len(merged_pcd.points)} points\n")
                 f.write(f"Total processing time: {total_time:.2f}s\n\n")
+                
+                # Write performance profiling data
+                f.write(f"Performance Profiling:\n")
+                f.write(f"----------------------\n")
+                profiling_summary = self.profiler.get_summary()
+                if profiling_summary:
+                    # Sort by total time (descending)
+                    sorted_ops = sorted(profiling_summary.items(), key=lambda x: x[1]['total_time'], reverse=True)
+                    for operation, stats in sorted_ops:
+                        f.write(f"  {operation}:\n")
+                        f.write(f"    Total time: {stats['total_time']:.3f}s\n")
+                        f.write(f"    Average time: {stats['average_time']:.3f}s\n")
+                        f.write(f"    Count: {stats['count']}\n")
+                        if stats['count'] > 1:
+                            f.write(f"    Min/Max: {stats['min_time']:.3f}s / {stats['max_time']:.3f}s\n")
+                        f.write(f"\n")
+                else:
+                    f.write(f"  No profiling data available\n")
+                f.write(f"\n")
                 f.write(f"Image pairs processed:\n")
                 for i, (img_id1, img_id2, point_count) in enumerate(self.point_cloud_metadata):
                     name1 = self.colmap_dataset.images[img_id1].name

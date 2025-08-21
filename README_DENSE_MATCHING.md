@@ -78,7 +78,7 @@ python demo/demo_dense_matching.py \
 | `--colmap_path` | Path to COLMAP sparse reconstruction directory | Required |
 | `--images_dir` | Directory containing input images | Required |
 | `--output_dir` | Output directory for results | Required |
-| `--model_type` | RoMa model (`roma_outdoor` or `tiny_roma`) | `roma_outdoor` |
+| `--model_type` | RoMa model (`roma_outdoor`, `roma_indoor`, or `tiny_roma`) | `roma_outdoor` |
 | `--resolution` | Target resolution for matching [height width] | `[864, 1152]` |
 | `--min_common_points` | Minimum common 3D points for pair selection | `100` |
 | `--min_baseline` | Minimum baseline distance for pair selection | `0.1` |

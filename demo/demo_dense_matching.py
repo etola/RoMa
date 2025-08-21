@@ -59,7 +59,7 @@ import open3d as o3d
 sys.path.append(str(Path(__file__).parent.parent))
 
 from colmap_utils import COLMAPDataset, triangulate_points
-from romatch import roma_outdoor, tiny_roma_v1_outdoor
+from romatch import roma_outdoor, tiny_roma_v1_outdoor, roma_indoor
 from romatch.utils.utils import tensor_to_pil
 
 # Configure logging
@@ -369,7 +369,7 @@ class DenseMatchingPipeline:
             colmap_path: Path to COLMAP sparse reconstruction
             images_dir: Directory containing images
             output_dir: Output directory for results
-            model_type: RoMa model type ("tiny_roma" or "roma_outdoor")
+            model_type: RoMa model type ("tiny_roma", "roma_outdoor", or "roma_indoor")
             resolution: Target resolution for matching
             min_triangulation_angle: Minimum triangulation angle in degrees
             save_visualizations: Whether to save match visualizations (default: False)
@@ -399,6 +399,8 @@ class DenseMatchingPipeline:
         logger.info(f"Initializing {model_type} model...")
         if model_type == "roma_outdoor":
             self.roma_model = roma_outdoor(device=device, coarse_res=560, upsample_res=resolution)
+        elif model_type == "roma_indoor":
+            self.roma_model = roma_indoor(device=device, coarse_res=560, upsample_res=resolution)
         elif model_type == "tiny_roma":
             self.roma_model = tiny_roma_v1_outdoor(device=device)
         else:
@@ -407,7 +409,7 @@ class DenseMatchingPipeline:
         self.model_type = model_type
         
         # Store the actual resolution used by the model
-        if model_type == "roma_outdoor":
+        if model_type in ["roma_outdoor", "roma_indoor"]:
             self.actual_resolution = self.roma_model.get_output_resolution()  # (H, W)
         else:  # tiny_roma - resolution will be determined during first match
             self.actual_resolution = None
@@ -579,7 +581,7 @@ class DenseMatchingPipeline:
         # Load and resize images
         start_time = time.time()
         
-        if self.model_type == "roma_outdoor":
+        if self.model_type in ["roma_outdoor", "roma_indoor"]:
             with self.profiler.profile("image_loading_and_resize"):
                 H, W = self.roma_model.get_output_resolution()
                 # Use cache for faster loading and resizing
@@ -922,7 +924,7 @@ class DenseMatchingPipeline:
         x2 = (torch.tensor(np.array(img2)) / 255).to(device).permute(2, 0, 1)
         
         # Create warped visualization
-        if self.model_type == "roma_outdoor":
+        if self.model_type in ["roma_outdoor", "roma_indoor"]:
             im2_transfer_rgb = F.grid_sample(
                 x2[None], warp[:,:W, 2:][None], mode="bilinear", align_corners=False
             )[0]
@@ -1301,7 +1303,7 @@ def main():
     parser.add_argument("-o", "--output_dir",
                        help="Output directory for results (default: scene_dir/output, or relative to scene_dir if specified)")
     parser.add_argument("-m", "--model_type", default=None,
-                       choices=["roma_outdoor", "tiny_roma"],
+                       choices=["roma_outdoor", "roma_indoor", "tiny_roma"],
                        help="RoMa model type to use (default: tiny_roma)")
     parser.add_argument("-r", "--resolution", nargs=2, type=int, default=None,
                        help="Target resolution for matching [height width] (default: [864, 1152])")

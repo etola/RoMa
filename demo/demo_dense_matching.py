@@ -20,6 +20,20 @@ Usage:
     python demo_dense_matching.py -s /path/to/scene \
                                   -c /path/to/custom/colmap \
                                   -i /path/to/custom/images
+
+JSON Configuration Support:
+    # Create an example configuration file:
+    python demo_dense_matching.py --create_example_config config_example.json
+    
+    # Run with JSON configuration:
+    python demo_dense_matching.py -j my_config.json
+    
+    # Override JSON values with command line arguments:
+    python demo_dense_matching.py -j my_config.json -s /different/scene -v
+    
+    # The final configuration is automatically saved as run_config.json in the output directory
+    # You can reuse this saved configuration to reproduce results:
+    python demo_dense_matching.py -j /path/to/output/run_config.json
 """
 
 import os
@@ -59,6 +73,123 @@ if torch.backends.mps.is_available():
     device = torch.device('mps')
 
 logger.info(f"Using device: {device}")
+
+
+def load_json_config(json_path: str) -> Dict:
+    """
+    Load configuration from JSON file.
+    
+    Args:
+        json_path: Path to JSON configuration file
+        
+    Returns:
+        Dictionary containing configuration parameters
+    """
+    try:
+        with open(json_path, 'r') as f:
+            config = json.load(f)
+        logger.info(f"Loaded configuration from: {json_path}")
+        return config
+    except FileNotFoundError:
+        logger.error(f"JSON configuration file not found: {json_path}")
+        raise
+    except json.JSONDecodeError as e:
+        logger.error(f"Invalid JSON in configuration file {json_path}: {e}")
+        raise
+    except Exception as e:
+        logger.error(f"Error loading JSON configuration: {e}")
+        raise
+
+
+def merge_configs(json_config: Dict, cli_args: Dict) -> Dict:
+    """
+    Merge JSON configuration with command line arguments.
+    Command line arguments take precedence over JSON config.
+    
+    Args:
+        json_config: Configuration loaded from JSON file
+        cli_args: Command line arguments (only non-None values)
+        
+    Returns:
+        Merged configuration dictionary
+    """
+    # Start with JSON config as base
+    merged_config = json_config.copy()
+    
+    # Override with command line arguments (only if they were explicitly provided)
+    for key, value in cli_args.items():
+        if value is not None:
+            merged_config[key] = value
+            logger.info(f"CLI override: {key} = {value}")
+    
+    return merged_config
+
+
+def save_config_to_output(config: Dict, output_dir: str) -> str:
+    """
+    Save the final configuration to output directory.
+    
+    Args:
+        config: Configuration dictionary to save
+        output_dir: Output directory path
+        
+    Returns:
+        Path to saved configuration file
+    """
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    
+    config_file = output_path / "run_config.json"
+    
+    # Create a clean config for saving (remove any non-serializable items)
+    clean_config = {}
+    for key, value in config.items():
+        try:
+            # Test if value is JSON serializable
+            json.dumps(value)
+            clean_config[key] = value
+        except (TypeError, ValueError):
+            # Convert to string if not directly serializable
+            clean_config[key] = str(value)
+    
+    with open(config_file, 'w') as f:
+        json.dump(clean_config, f, indent=2)
+    
+    logger.info(f"Saved run configuration to: {config_file}")
+    return str(config_file)
+
+
+def create_example_config(output_path: str):
+    """
+    Create an example configuration file with all available options.
+    
+    Args:
+        output_path: Path where to save the example config
+    """
+    example_config = {
+        "scene_dir": "/path/to/your/scene",
+        "colmap_path": None,
+        "images_dir": None,
+        "output_dir": None,
+        "model_type": "tiny_roma",
+        "resolution": [864, 1152],
+        "min_common_points": 100,
+        "min_baseline": 0.1,
+        "max_baseline": 2.0,
+        "max_pairs_per_image": 5,
+        "max_points": 100000,
+        "pairs_file": "pairs.json",
+        "disable_bbox_filter": False,
+        "min_triangulation_angle": 2.0,
+        "enable_visualizations": False,
+        "disable_prescaling": False,
+        "cache_size": 100
+    }
+    
+    with open(output_path, 'w') as f:
+        json.dump(example_config, f, indent=2)
+    
+    logger.info(f"Created example configuration file: {output_path}")
 
 
 class Profiler:
@@ -1154,77 +1285,166 @@ class DenseMatchingPipeline:
 def main():
     parser = ArgumentParser(description="Dense matching with RoMa and COLMAP integration",
                           formatter_class=ArgumentDefaultsHelpFormatter)
-    parser.add_argument("-s", "--scene_dir", required=True, 
-                       help="Main scene directory containing images/ and sparse/ subdirectories")
+    
+    # JSON configuration support
+    parser.add_argument("-j", "--json_config", 
+                       help="Path to JSON configuration file. CLI arguments override JSON values.")
+    parser.add_argument("--create_example_config", 
+                       help="Create an example configuration file at the specified path and exit")
+    
+    parser.add_argument("-s", "--scene_dir", 
+                       help="Main scene directory containing images/ and sparse/ subdirectories (required unless using JSON config)")
     parser.add_argument("-c", "--colmap_path", 
                        help="Path to COLMAP sparse reconstruction directory (default: auto-detect scene_dir/sparse/0 or scene_dir/sparse)")
     parser.add_argument("-i", "--images_dir",
                        help="Directory containing input images (default: scene_dir/images)")
     parser.add_argument("-o", "--output_dir",
                        help="Output directory for results (default: scene_dir/output, or relative to scene_dir if specified)")
-    parser.add_argument("-m", "--model_type", default="tiny_roma",
+    parser.add_argument("-m", "--model_type", default=None,
                        choices=["roma_outdoor", "tiny_roma"],
-                       help="RoMa model type to use")
-    parser.add_argument("-r", "--resolution", nargs=2, type=int, default=[864, 1152],
-                       help="Target resolution for matching [height width]")
-    parser.add_argument("-p", "--min_common_points", type=int, default=100,
-                       help="Minimum common 3D points for pair selection")
-    parser.add_argument("-b", "--min_baseline", type=float, default=0.1,
-                       help="Minimum baseline distance for pair selection")
-    parser.add_argument("-B", "--max_baseline", type=float, default=2.0,
-                       help="Maximum baseline distance for pair selection")
-    parser.add_argument("-n", "--max_pairs_per_image", type=int, default=5,
-                       help="Maximum pairs per image (duplicates automatically removed)")
-    parser.add_argument("-P", "--max_points", type=int, default=100000,
-                       help="Maximum number of points to triangulate per pair")
-    parser.add_argument("-f", "--pairs_file", type=str, default="pairs.json",
+                       help="RoMa model type to use (default: tiny_roma)")
+    parser.add_argument("-r", "--resolution", nargs=2, type=int, default=None,
+                       help="Target resolution for matching [height width] (default: [864, 1152])")
+    parser.add_argument("-p", "--min_common_points", type=int, default=None,
+                       help="Minimum common 3D points for pair selection (default: 100)")
+    parser.add_argument("-b", "--min_baseline", type=float, default=None,
+                       help="Minimum baseline distance for pair selection (default: 0.1)")
+    parser.add_argument("-B", "--max_baseline", type=float, default=None,
+                       help="Maximum baseline distance for pair selection (default: 2.0)")
+    parser.add_argument("-n", "--max_pairs_per_image", type=int, default=None,
+                       help="Maximum pairs per image (duplicates automatically removed) (default: 5)")
+    parser.add_argument("-P", "--max_points", type=int, default=None,
+                       help="Maximum number of points to triangulate per pair (default: 100000)")
+    parser.add_argument("-f", "--pairs_file", type=str, default=None,
                        help="Filename to save pairs information as JSON in output directory (default: pairs.json)")
     parser.add_argument("-d", "--disable_bbox_filter", action="store_true",
                        help="Disable bounding box filtering of point clouds")
-    parser.add_argument("-a", "--min_triangulation_angle", type=float, default=2.0,
+    parser.add_argument("-a", "--min_triangulation_angle", type=float, default=None,
                        help="Minimum triangulation angle in degrees for point filtering (default: 2.0)")
     parser.add_argument("-v", "--enable_visualizations", action="store_true",
                        help="Enable saving of match visualizations")
     parser.add_argument("-S", "--disable_prescaling", action="store_true",
                        help="Disable image pre-scaling for tiny_roma model (slower but uses less disk space)")
-    parser.add_argument("--cache_size", type=int, default=100,
-                       help="Maximum number of cached image variants (higher = faster but more memory)")
+    parser.add_argument("--cache_size", type=int, default=None,
+                       help="Maximum number of cached image variants (higher = faster but more memory) (default: 100)")
     
     args = parser.parse_args()
     
-    # Derive paths from scene_dir
-    scene_dir = Path(args.scene_dir)
+    # Handle special commands
+    if args.create_example_config:
+        create_example_config(args.create_example_config)
+        logger.info("Example configuration created. Edit the file and run with -j <config_file>")
+        return
     
-    # Set default paths relative to scene_dir if not provided
-    if not args.colmap_path:
+    # Load and merge configurations
+    config = {}
+    
+    if args.json_config:
+        # Load JSON configuration
+        json_config = load_json_config(args.json_config)
+        
+        # Convert args to dict (only include non-None values for CLI override)
+        cli_args = {}
+        for key, value in vars(args).items():
+            if key not in ['json_config', 'create_example_config'] and value is not None:
+                cli_args[key] = value
+        
+        # Check if scene_dir was overridden via CLI
+        scene_dir_overridden = 'scene_dir' in cli_args
+        
+        # Merge configurations (CLI overrides JSON)
+        config = merge_configs(json_config, cli_args)
+        
+        # Store whether scene_dir was overridden for path derivation
+        config['_scene_dir_overridden'] = scene_dir_overridden
+    else:
+        # Use command line arguments only
+        config = {key: value for key, value in vars(args).items() 
+                 if key not in ['json_config', 'create_example_config']}
+        config['_scene_dir_overridden'] = False
+    
+    # Apply default values for any missing required parameters
+    defaults = {
+        'model_type': 'tiny_roma',
+        'resolution': [864, 1152],
+        'min_common_points': 100,
+        'min_baseline': 0.1,
+        'max_baseline': 2.0,
+        'max_pairs_per_image': 5,
+        'max_points': 100000,
+        'pairs_file': 'pairs.json',
+        'disable_bbox_filter': False,
+        'min_triangulation_angle': 2.0,
+        'enable_visualizations': False,
+        'disable_prescaling': False,
+        'cache_size': 100
+    }
+    
+    for key, default_value in defaults.items():
+        if key not in config or config[key] is None:
+            config[key] = default_value
+    
+    # Validate that scene_dir is provided (either via JSON or CLI)
+    if not config.get('scene_dir'):
+        logger.error("scene_dir is required. Provide it via command line (-s) or JSON configuration file.")
+        parser.print_help()
+        return
+    
+    # Derive paths from scene_dir
+    scene_dir = Path(config['scene_dir'])
+    scene_dir_overridden = config.pop('_scene_dir_overridden', False)
+    
+    # If scene_dir was overridden via CLI, re-derive all relative paths
+    # Otherwise, only set paths that are not already provided
+    should_derive_colmap = not config.get('colmap_path') or scene_dir_overridden
+    should_derive_images = not config.get('images_dir') or scene_dir_overridden
+    should_derive_output = not config.get('output_dir') or scene_dir_overridden
+    
+    if should_derive_colmap:
         # Try common COLMAP sparse directory patterns
         sparse_candidates = [
             scene_dir / "sparse" / "0",  # Most common: sparse/0
             scene_dir / "sparse",        # Direct sparse folder
             scene_dir / "colmap" / "sparse" / "0",  # Alternative structure
-            scene_dir / "colmap" / "sparse"
+            scene_dir / "colmap" / "sparse",
+            scene_dir / "glomap" / "sparse" / "0"
         ]
         
         # Use the first existing candidate
         sparse_found = False
         for candidate in sparse_candidates:
             if candidate.exists() and candidate.is_dir():
-                args.colmap_path = str(candidate)
+                config['colmap_path'] = str(candidate)
                 sparse_found = True
                 break
         
         if not sparse_found:
-            args.colmap_path = str(scene_dir / "sparse")  # Default fallback
+            config['colmap_path'] = str(scene_dir / "sparse")  # Default fallback
+            
+        if scene_dir_overridden:
+            logger.info(f"Re-derived colmap_path due to scene_dir override: {config['colmap_path']}")
     
-    if not args.images_dir:
-        args.images_dir = str(scene_dir / "images")
+    if should_derive_images:
+        config['images_dir'] = str(scene_dir / "images")
+        if scene_dir_overridden:
+            logger.info(f"Re-derived images_dir due to scene_dir override: {config['images_dir']}")
     
-    if not args.output_dir:
-        args.output_dir = str(scene_dir / "output")
+    if should_derive_output:
+        config['output_dir'] = str(scene_dir / "output")
+        if scene_dir_overridden:
+            logger.info(f"Re-derived output_dir due to scene_dir override: {config['output_dir']}")
     else:
-        # If output_dir is provided, make it relative to scene_dir
-        if not Path(args.output_dir).is_absolute():
-            args.output_dir = str(scene_dir / args.output_dir)
+        # If output_dir is provided and not being re-derived, make it relative to scene_dir if needed
+        if not Path(config['output_dir']).is_absolute():
+            config['output_dir'] = str(scene_dir / config['output_dir'])
+    
+    # Now convert to ConfigObj after all path resolution is complete
+    class ConfigObj:
+        def __init__(self, config_dict):
+            for key, value in config_dict.items():
+                setattr(self, key, value)
+    
+    args = ConfigObj(config)
     
     # Log the derived paths
     logger.info(f"Scene directory: {scene_dir}")
@@ -1245,26 +1465,11 @@ def main():
         logger.error(f"Images directory does not exist: {args.images_dir}")
         return
     
-    # Convert args to dictionary for saving to summary
-    command_args = {
-        'scene_dir': args.scene_dir,
-        'colmap_path': args.colmap_path,
-        'images_dir': args.images_dir,
-        'output_dir': args.output_dir,
-        'model_type': args.model_type,
-        'resolution': args.resolution,
-        'min_common_points': args.min_common_points,
-        'min_baseline': args.min_baseline,
-        'max_baseline': args.max_baseline,
-        'max_pairs_per_image': args.max_pairs_per_image,
-        'max_points': args.max_points,
-        'pairs_file': args.pairs_file,
-        'disable_bbox_filter': args.disable_bbox_filter,
-        'min_triangulation_angle': args.min_triangulation_angle,
-        'enable_visualizations': args.enable_visualizations,
-        'disable_prescaling': args.disable_prescaling,
-        'cache_size': args.cache_size
-    }
+    # Use the merged configuration
+    command_args = config.copy()
+    
+    # Save the final configuration to output directory
+    save_config_to_output(command_args, args.output_dir)
     
     # Create pipeline
     pipeline = DenseMatchingPipeline(

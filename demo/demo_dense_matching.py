@@ -435,6 +435,66 @@ def get_prescaled_image_path(image_path: str, scaled_images_dir: Path) -> Path:
     return scaled_images_dir / image_filename
 
 
+def generate_depth_map_from_camera_coordinates(points_3d_cam1: np.ndarray,
+                                              kpts1: np.ndarray,
+                                              image_width: int,
+                                              image_height: int) -> np.ndarray:
+    """
+    Generate a depth map for image 1 from 3D points already in camera 1's coordinate system.
+    Uses vectorized operations for fast computation.
+    
+    Args:
+        points_3d_cam1: 3D points in camera 1's coordinate system (N, 3)
+        kpts1: 2D keypoints in image 1 (N, 2) - integer pixel locations at warp resolution
+        image_width, image_height: Current image resolution (warp resolution)
+        
+    Returns:
+        depth_map: (H, W) depth map with depths at keypoint locations, zeros elsewhere
+    """
+    
+    # Extract depths (Z coordinates in camera coordinate system)
+    depths = points_3d_cam1[:, 2]
+    
+    # Filter out points behind the camera (negative depth)
+    valid_mask = depths > 0
+    if not np.any(valid_mask):
+        # No valid points, return empty depth map
+        return np.zeros((image_height, image_width), dtype=np.float32)
+    
+    # Keep only valid points
+    valid_kpts1 = kpts1[valid_mask]
+    valid_depths = depths[valid_mask]
+    
+    # Convert keypoints to integer pixel coordinates
+    # kpts1 should already be integer locations, but ensure they are
+    x_coords = np.round(valid_kpts1[:, 0]).astype(np.int32)
+    y_coords = np.round(valid_kpts1[:, 1]).astype(np.int32)
+    
+    # Filter points that are within image bounds
+    bounds_mask = (
+        (x_coords >= 0) & (x_coords < image_width) &
+        (y_coords >= 0) & (y_coords < image_height)
+    )
+    
+    if not np.any(bounds_mask):
+        # No points within bounds
+        return np.zeros((image_height, image_width), dtype=np.float32)
+    
+    # Keep only in-bounds points
+    x_coords = x_coords[bounds_mask]
+    y_coords = y_coords[bounds_mask]
+    final_depths = valid_depths[bounds_mask]
+    
+    # Initialize depth map
+    depth_map = np.zeros((image_height, image_width), dtype=np.float32)
+    
+    # Directly assign depths to corresponding pixel locations
+    # Since each 3D point came from a unique kpts1 location, no conflicts possible
+    depth_map[y_coords, x_coords] = final_depths
+    
+    return depth_map
+
+
 class DenseMatchingPipeline:
     """Pipeline for dense matching and point cloud generation."""
     
@@ -732,38 +792,18 @@ class DenseMatchingPipeline:
                     img2_resized = get_image_for_model(str(img_path2), self.model_type, self.image_cache, 
                                                      target_size=(new_w2, new_h2))
                 
-                # Save temporarily and match
-                import tempfile
-                with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp1, \
-                     tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp2:
-                    img1_resized.save(tmp1.name)
-                    img2_resized.save(tmp2.name)
-                    
-                    try:
-                        with self.profiler.profile("tiny_roma_model_inference_fallback"):
-                            warp, certainty = self.roma_model.match(tmp1.name, tmp2.name)
-                        H, W = warp.shape[:2]
-                        # Store actual resolution for tiny_roma on first match
-                        if self.actual_resolution is None:
-                            self.actual_resolution = (H, W)
-                        logger.info(f"  Warp shape: {warp.shape}")
-                        logger.info(f"  Certainty shape: {certainty.shape}")
-                        logger.info(f"  Resized image 1: {img1_resized.size}")
-                        logger.info(f"  Resized image 2: {img2_resized.size}")
-                        
-                        # Clean up temporary files
-                        os.unlink(tmp1.name)
-                        os.unlink(tmp2.name)
-                        
-                    except Exception as e:
-                        logger.error(f"  Error during matching: {e}")
-                        # Clean up temporary files even on error
-                        try:
-                            os.unlink(tmp1.name)
-                            os.unlink(tmp2.name)
-                        except:
-                            pass
-                        raise
+                # Match directly with PIL Images - no temporary files needed!
+                with self.profiler.profile("tiny_roma_model_inference_fallback"):
+                    warp, certainty = self.roma_model.match(img1_resized, img2_resized)
+                
+                H, W = warp.shape[:2]
+                # Store actual resolution for tiny_roma on first match
+                if self.actual_resolution is None:
+                    self.actual_resolution = (H, W)
+                logger.info(f"  Warp shape: {warp.shape}")
+                logger.info(f"  Certainty shape: {certainty.shape}")
+                logger.info(f"  Resized image 1: {img1_resized.size}")
+                logger.info(f"  Resized image 2: {img2_resized.size}")
         
         match_time = time.time() - start_time
         
@@ -798,7 +838,8 @@ class DenseMatchingPipeline:
                            img_id2: int,
                            certainty_threshold: float = 0.3,
                            max_points: int = 100000,
-                           use_bbox_filter: bool = True) -> o3d.geometry.PointCloud:
+                           use_bbox_filter: bool = True,
+                           generate_depth_map: bool = True) -> tuple[o3d.geometry.PointCloud, np.ndarray]:
         """
         Generate point cloud from dense matching results.
         
@@ -808,6 +849,10 @@ class DenseMatchingPipeline:
             img_id1, img_id2: Image IDs
             certainty_threshold: Minimum certainty for triangulation
             max_points: Maximum number of points to triangulate
+            generate_depth_map: Whether to generate depth map for image 1
+            
+        Returns:
+            tuple: (point_cloud, depth_map) where depth_map is None if generate_depth_map=False
         """
         logger.info(f"Generating point cloud for pair {img_id1}-{img_id2}")
         
@@ -928,7 +973,7 @@ class DenseMatchingPipeline:
         
         # Triangulate 3D points
         with self.profiler.profile("triangulation"):
-            points_3d = triangulate_points(kpts1_np, kpts2_np, K1_scaled, K2_scaled, R_rel, t_rel)
+            points_3d_cam1 = triangulate_points(kpts1_np, kpts2_np, K1_scaled, K2_scaled, R_rel, t_rel)
         
         # Transform points from camera 1 coordinate system to world coordinates
         with self.profiler.profile("coordinate_transformation"):
@@ -936,12 +981,23 @@ class DenseMatchingPipeline:
             # COLMAP uses cam_from_world: X_cam = R @ X_world + t
             # So to transform from camera to world: X_world = R^T @ (X_cam - t)
             t1_flat = t1.flatten()  # Ensure t1 is 1D for broadcasting
-            points_3d_world = (R1.T @ (points_3d - t1_flat).T).T
+            points_3d_world = (R1.T @ (points_3d_cam1 - t1_flat).T).T
             
             # Use world coordinates for further processing
             points_3d = points_3d_world
         
         logger.info(f"  Point cloud center: [{np.mean(points_3d, axis=0)[0]:.3f}, {np.mean(points_3d, axis=0)[1]:.3f}, {np.mean(points_3d, axis=0)[2]:.3f}]")
+        
+        # Generate depth map for image 1 if requested
+        depth_map = None
+        if generate_depth_map:
+            with self.profiler.profile("depth_map_generation"):
+                depth_map = generate_depth_map_from_camera_coordinates(
+                    points_3d_cam1, kpts1_np, W, H
+                )
+                logger.info(f"  Generated depth map: {depth_map.shape}, "
+                           f"non-zero pixels: {np.count_nonzero(depth_map)}, "
+                           f"depth range: [{np.min(depth_map[depth_map > 0]):.3f}, {np.max(depth_map):.3f}]")
         
         # Get colors from image 1
         with self.profiler.profile("color_extraction"):
@@ -987,7 +1043,83 @@ class DenseMatchingPipeline:
         with self.profiler.profile("outlier_removal"):
             pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
         
-        return pcd
+        return pcd, depth_map
+    
+    def save_depth_map(self, depth_map: np.ndarray, img_id: int, output_path: str = None):
+        """
+        Save depth map as both raw numpy array and visualization.
+        
+        Args:
+            depth_map: (H, W) depth map
+            img_id: Image ID for filename
+            output_path: Optional custom output path
+        """
+        if depth_map is None:
+            logger.warning("No depth map to save")
+            return
+            
+        if output_path is None:
+            img_name = self.colmap_dataset.images[img_id].name
+            base_name = Path(img_name).stem
+            output_path = self.output_dir / "depth_maps" / f"{base_name}_depth.npz"
+        else:
+            output_path = Path(output_path)
+            
+        # Create output directory
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Save raw depth map
+        np.savez_compressed(output_path, depth=depth_map)
+        logger.info(f"Saved depth map to {output_path}")
+        
+        # Create and save visualization
+        vis_path = output_path.with_suffix('.png')
+        try:
+            self._save_depth_visualization(depth_map, vis_path)
+            logger.info(f"Saved depth visualization to {vis_path}")
+        except Exception as e:
+            logger.warning(f"Failed to save depth visualization: {e}")
+            logger.info("Depth map data saved successfully, but visualization skipped")
+    
+    def _save_depth_visualization(self, depth_map: np.ndarray, vis_path: Path):
+        """Create and save depth map visualization using OpenCV."""
+        import cv2
+        
+        # Mask for valid depths
+        valid_mask = depth_map > 0
+        
+        if not np.any(valid_mask):
+            logger.warning("No valid depths to visualize")
+            return
+        
+        # Normalize depth values for visualization
+        min_depth = np.min(depth_map[valid_mask])
+        max_depth = np.max(depth_map[valid_mask])
+        
+        # Create normalized depth map (0-255 range)
+        norm_depth = np.zeros_like(depth_map, dtype=np.uint8)
+        if max_depth > min_depth:
+            norm_depth[valid_mask] = ((depth_map[valid_mask] - min_depth) / (max_depth - min_depth) * 255).astype(np.uint8)
+        
+        # Apply viridis colormap using OpenCV
+        colored_depth = cv2.applyColorMap(norm_depth, cv2.COLORMAP_VIRIDIS)
+        # Set invalid pixels to black
+        colored_depth[~valid_mask] = [0, 0, 0]
+        
+        # Add text overlay with depth info
+        text_color = (255, 255, 255)  # White text
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.7
+        thickness = 2
+        
+        text1 = f'Depth Range: [{min_depth:.3f}, {max_depth:.3f}]m'
+        text2 = f'Valid pixels: {np.count_nonzero(valid_mask)}/{depth_map.size}'
+        
+        cv2.putText(colored_depth, text1, (10, 30), font, font_scale, text_color, thickness)
+        cv2.putText(colored_depth, text2, (10, 60), font, font_scale, text_color, thickness)
+        
+        # Save image (OpenCV uses BGR format)
+        cv2.imwrite(str(vis_path), colored_depth)
     
     def save_visualization(self, 
                           warp: torch.Tensor,
@@ -1065,11 +1197,15 @@ class DenseMatchingPipeline:
             logger.info(f"  Visualizations not enabled (use --enable_visualizations to save)")
         
         # Generate point cloud
-        pcd = self.generate_point_cloud(warp, certainty, img_id1, img_id2, use_bbox_filter=use_bbox_filter, max_points=max_points)
+        pcd, depth_map = self.generate_point_cloud(warp, certainty, img_id1, img_id2, use_bbox_filter=use_bbox_filter, max_points=max_points)
         
         # Save individual point cloud
         pcd_path = self.output_dir / "point_clouds" / f"cloud_{img_id1}_{img_id2}.ply"
         o3d.io.write_point_cloud(str(pcd_path), pcd)
+        
+        # Save depth map if generated
+        if depth_map is not None:
+            self.save_depth_map(depth_map, img_id1)
         
         # Store metadata for summary
         point_count = len(pcd.points)

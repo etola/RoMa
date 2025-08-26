@@ -191,6 +191,86 @@ class COLMAPDataset:
         
         return np.linalg.norm(t2 - t1)
     
+    def compute_pair_bounding_box(self, img_id1: int, img_id2: int, 
+                                 min_track_size: int = 3,
+                                 margin_factor: float = 0.1) -> Dict:
+        """
+        Compute bounding box from reliable 3D points visible in both images.
+        
+        This creates a tight bounding box specific to an image pair, containing only
+        reliable 3D points (with sufficient track length) that are visible from both images.
+        
+        Args:
+            img_id1: First image ID
+            img_id2: Second image ID
+            min_track_size: Minimum track size for point to be considered reliable (default: 3)
+            margin_factor: Additional margin as fraction of box size (default: 0.1 = 10%)
+            
+        Returns:
+            Dictionary containing bounding box information:
+            - 'min': (3,) minimum coordinates [x, y, z]
+            - 'max': (3,) maximum coordinates [x, y, z]
+            - 'center': (3,) center coordinates [x, y, z]
+            - 'size': (3,) box dimensions [width, height, depth]
+            - 'volume': scalar volume of the bounding box
+            - 'num_points': number of 3D points used
+            - 'margin_applied': margin factor used
+            - 'image_pair': (img_id1, img_id2)
+        """
+        # Get common points visible in both images (uses cached lookup for efficiency)
+        common_point_ids = self.get_common_points(img_id1, img_id2)
+        
+        if not common_point_ids:
+            raise ValueError(f"No common points found between images {img_id1} and {img_id2}")
+        
+        # Filter by track size and collect 3D coordinates
+        reliable_points = []
+        reliable_ids = []
+        
+        for point_id in common_point_ids:
+            if point_id in self.points3d:
+                point = self.points3d[point_id]
+                track_size = len(point.track.elements)
+                
+                if track_size >= min_track_size:
+                    reliable_points.append(point.xyz)
+                    reliable_ids.append(point_id)
+        
+        if not reliable_points:
+            raise ValueError(f"No reliable points (track_size >= {min_track_size}) found between images {img_id1} and {img_id2}")
+        
+        # Convert to numpy array for efficient computation
+        points_array = np.array(reliable_points)
+        
+        # Compute basic bounding box
+        min_coords = np.min(points_array, axis=0)
+        max_coords = np.max(points_array, axis=0)
+        
+        # Apply margin
+        if margin_factor > 0:
+            box_size = max_coords - min_coords
+            margin = box_size * margin_factor
+            min_coords -= margin
+            max_coords += margin
+        
+        # Compute derived properties
+        center = (min_coords + max_coords) / 2
+        size = max_coords - min_coords
+        volume = np.prod(size)
+        
+        bbox_info = {
+            'min': min_coords,
+            'max': max_coords,
+            'center': center,
+            'size': size,
+            'volume': volume,
+            'num_points': len(reliable_points),
+            'margin_applied': margin_factor,
+            'image_pair': (img_id1, img_id2)
+        }
+        
+        return bbox_info
+    
     def select_image_pairs(self, 
                           min_common_points: int = 100,
                           min_baseline: float = 0.1,

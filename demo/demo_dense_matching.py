@@ -508,7 +508,10 @@ class DenseMatchingPipeline:
                  save_visualizations: bool = False,
                  enable_prescaling: bool = True,
                  command_args: Optional[Dict] = None,
-                 cache_size: int = 100):
+                 cache_size: int = 100,
+                 include_cameras_in_bbox: bool = False,
+                 pair_bbox_min_track_size: int = 3,
+                 pair_bbox_margin: float = 0.1):
         """
         Initialize dense matching pipeline.
         
@@ -523,6 +526,9 @@ class DenseMatchingPipeline:
             enable_prescaling: Pre-scale images for tiny_roma model (speeds up processing)
             command_args: Dictionary of command line arguments used to call the program
             cache_size: Maximum number of cached image variants (higher = faster but more memory)
+            include_cameras_in_bbox: Whether to include camera centers in scene bounding box computation
+            pair_bbox_min_track_size: Minimum track size for points used in pair bounding box computation
+            pair_bbox_margin: Margin factor for pair bounding box as fraction of box size
         """
         self.colmap_path = Path(colmap_path)
         self.images_dir = Path(images_dir)
@@ -530,6 +536,9 @@ class DenseMatchingPipeline:
         self.resolution = resolution
         self.min_triangulation_angle = min_triangulation_angle
         self.save_visualizations = save_visualizations
+        self.include_cameras_in_bbox = include_cameras_in_bbox
+        self.pair_bbox_min_track_size = pair_bbox_min_track_size
+        self.pair_bbox_margin = pair_bbox_margin
         
         # Create output directories
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -682,11 +691,15 @@ class DenseMatchingPipeline:
     
     def compute_scene_bounding_box(self, 
                                   min_visibility: int = 3,
-                                  include_cameras: bool = True,
+                                  include_cameras: bool = None,
                                   margin_factor: float = 0.15) -> Dict:
         """Compute scene bounding box from COLMAP data."""
         if self.scene_bbox is None:
-            logger.info("Computing scene bounding box for point cloud filtering...")
+            # Use instance variable if include_cameras not explicitly set
+            if include_cameras is None:
+                include_cameras = self.include_cameras_in_bbox
+                
+            logger.info(f"Computing scene bounding box for point cloud filtering (include_cameras={include_cameras})...")
             try:
                 self.scene_bbox = self.colmap_dataset.compute_scene_bounding_box(
                     min_visibility=min_visibility,
@@ -1252,17 +1265,35 @@ class DenseMatchingPipeline:
                 points_3d, colors, cam_center1, cam_center2, min_angle_degrees=self.min_triangulation_angle
             )
         
-        # Optional: Filter by scene bounding box
+        # Optional: Filter by pair-specific bounding box
         if use_bbox_filter and len(points_3d) > 0:
-            with self.profiler.profile("bounding_box_filtering"):
-                scene_bbox = self.compute_scene_bounding_box()
-                if scene_bbox is not None:
-                    filtered_points, bbox_mask = self.colmap_dataset.filter_points_by_bbox(points_3d, scene_bbox)
-                    filtered_colors = colors[bbox_mask]
+            with self.profiler.profile("pair_bounding_box_filtering"):
+                try:
+                    pair_bbox = self.colmap_dataset.compute_pair_bounding_box(
+                        img_id1, img_id2, 
+                        min_track_size=self.pair_bbox_min_track_size, 
+                        margin_factor=self.pair_bbox_margin
+                    )
                     
-                    logger.info(f"  Bounding box filter: {len(filtered_points)}/{len(points_3d)} points retained")
+                    # Filter points using pair-specific bounding box
+                    bbox_min, bbox_max = pair_bbox['min'], pair_bbox['max']
+                    bbox_filter = (
+                        (points_3d[:, 0] >= bbox_min[0]) & (points_3d[:, 0] <= bbox_max[0]) &
+                        (points_3d[:, 1] >= bbox_min[1]) & (points_3d[:, 1] <= bbox_max[1]) &
+                        (points_3d[:, 2] >= bbox_min[2]) & (points_3d[:, 2] <= bbox_max[2])
+                    )
+                    
+                    filtered_points = points_3d[bbox_filter]
+                    filtered_colors = colors[bbox_filter]
+                    
+                    logger.info(f"  Pair bbox filter ({pair_bbox['num_points']} ref points): {len(filtered_points)}/{len(points_3d)} points retained")
                     points_3d = filtered_points
                     colors = filtered_colors
+                    
+                except ValueError as e:
+                    logger.warning(f"  Pair bbox filtering failed: {e}, skipping bbox filter")
+                except Exception as e:
+                    logger.warning(f"  Pair bbox filtering error: {e}, skipping bbox filter")
         
         logger.info(f"  Final point cloud: {len(points_3d)} points")
         
@@ -1762,19 +1793,32 @@ class DenseMatchingPipeline:
                     
                     logger.info(f"  After depth filtering: {len(points_3d_world)} points")
             
-            # Apply bounding box filtering
-            if use_bbox_filter and hasattr(self.colmap_dataset, 'scene_bounds') and len(points_3d_world) > 0:
-                bbox_min, bbox_max = self.colmap_dataset.scene_bounds
-                bbox_filter = (
-                    (points_3d_world[:, 0] >= bbox_min[0]) & (points_3d_world[:, 0] <= bbox_max[0]) &
-                    (points_3d_world[:, 1] >= bbox_min[1]) & (points_3d_world[:, 1] <= bbox_max[1]) &
-                    (points_3d_world[:, 2] >= bbox_min[2]) & (points_3d_world[:, 2] <= bbox_max[2])
-                )
-                
-                points_3d_world = points_3d_world[bbox_filter]
-                kpts1_np = kpts1_np[bbox_filter]
-                
-                logger.info(f"  After bbox filtering: {len(points_3d_world)} points")
+            # Apply pair-specific bounding box filtering
+            if use_bbox_filter and len(points_3d_world) > 0:
+                try:
+                    pair_bbox = self.colmap_dataset.compute_pair_bounding_box(
+                        img_id1, img_id2, 
+                        min_track_size=self.pair_bbox_min_track_size, 
+                        margin_factor=self.pair_bbox_margin
+                    )
+                    
+                    # Filter points using pair-specific bounding box
+                    bbox_min, bbox_max = pair_bbox['min'], pair_bbox['max']
+                    bbox_filter = (
+                        (points_3d_world[:, 0] >= bbox_min[0]) & (points_3d_world[:, 0] <= bbox_max[0]) &
+                        (points_3d_world[:, 1] >= bbox_min[1]) & (points_3d_world[:, 1] <= bbox_max[1]) &
+                        (points_3d_world[:, 2] >= bbox_min[2]) & (points_3d_world[:, 2] <= bbox_max[2])
+                    )
+                    
+                    points_3d_world = points_3d_world[bbox_filter]
+                    kpts1_np = kpts1_np[bbox_filter]
+                    
+                    logger.info(f"  After pair bbox filtering ({pair_bbox['num_points']} ref points): {len(points_3d_world)} points")
+                    
+                except ValueError as e:
+                    logger.warning(f"  Pair bbox filtering failed: {e}, skipping bbox filter")
+                except Exception as e:
+                    logger.warning(f"  Pair bbox filtering error: {e}, skipping bbox filter")
             
             # Convert back to camera coordinates for color extraction if needed
             # Transform: cam1_point = R1 @ world_point + t1
@@ -2278,7 +2322,13 @@ def main():
     parser.add_argument("-f", "--pairs_file", type=str, default=None,
                        help="Filename to save pairs information as JSON in output directory (default: pairs.json)")
     parser.add_argument("-d", "--disable_bbox_filter", action="store_true",
-                       help="Disable bounding box filtering of point clouds")
+                       help="Disable pair-specific bounding box filtering of point clouds")
+    parser.add_argument("--pair_bbox_min_track_size", type=int, default=None,
+                       help="Minimum track size for points used in pair bounding box computation (default: 3)")
+    parser.add_argument("--pair_bbox_margin", type=float, default=None,
+                       help="Margin factor for pair bounding box as fraction of box size (default: 0.1 = 10%%)")
+    parser.add_argument("--include_cameras_in_bbox", action="store_true",
+                       help="Include camera centers when computing scene bounding box (default: False)")
     parser.add_argument("-a", "--min_triangulation_angle", type=float, default=None,
                        help="Minimum triangulation angle in degrees for point filtering (default: 2.0)")
     parser.add_argument("-v", "--enable_visualizations", action="store_true",
@@ -2362,7 +2412,10 @@ def main():
         'multi_res': False,
         'pyramid_levels': 3,
         'debug': False,
-        'single_pair': None
+        'single_pair': None,
+        'include_cameras_in_bbox': False,
+        'pair_bbox_min_track_size': 3,
+        'pair_bbox_margin': 0.1
     }
     
     for key, default_value in defaults.items():
@@ -2467,7 +2520,10 @@ def main():
         save_visualizations=args.enable_visualizations,
         enable_prescaling=not args.disable_prescaling,
         command_args=command_args,
-        cache_size=args.cache_size
+        cache_size=args.cache_size,
+        include_cameras_in_bbox=config['include_cameras_in_bbox'],
+        pair_bbox_min_track_size=config['pair_bbox_min_track_size'],
+        pair_bbox_margin=config['pair_bbox_margin']
     )
     
     # Run pipeline

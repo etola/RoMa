@@ -543,11 +543,8 @@ class DenseMatchingPipeline:
         # Store command line arguments for summary
         self.command_args = command_args or {}
         
-        # Storage for point clouds
-        self.point_clouds = []
-        
-        # Storage for point cloud metadata (for summary)
-        self.point_cloud_metadata = []  # List of (img_id1, img_id2, point_count)
+        # Note: Individual point clouds are saved directly to disk in point_clouds/ folder
+        # instead of being stored in memory to handle large datasets efficiently
         
         # Performance profiler
         self.profiler = Profiler()
@@ -1403,6 +1400,10 @@ class DenseMatchingPipeline:
             merged_pcd = self._merge_point_clouds(point_clouds)
             logger.info(f"  Multi-resolution result: {len(merged_pcd.points)} total points from {len(point_clouds)} levels")
             
+            # Save individual merged point cloud from multi-resolution processing
+            pcd_path = self.output_dir / "point_clouds" / f"cloud_{img_id1}_{img_id2}.ply"
+            o3d.io.write_point_cloud(str(pcd_path), merged_pcd)
+            
             # Debug info for merged result
             if debug and len(merged_pcd.points) > 0:
                 points = np.asarray(merged_pcd.points)
@@ -1874,6 +1875,56 @@ class DenseMatchingPipeline:
         
         return merged_pcd
     
+    def load_and_merge_saved_point_clouds(self) -> o3d.geometry.PointCloud:
+        """
+        Load all saved point clouds from disk and merge them into a final point cloud.
+        
+        Returns:
+            Merged point cloud from all saved per-pair point clouds
+        """
+        point_clouds_dir = self.output_dir / "point_clouds"
+        
+        if not point_clouds_dir.exists():
+            logger.error(f"Point clouds directory not found: {point_clouds_dir}")
+            return o3d.geometry.PointCloud()
+        
+        # Find all saved point cloud files
+        ply_files = list(point_clouds_dir.glob("cloud_*.ply"))
+        
+        if not ply_files:
+            logger.error(f"No point cloud files found in: {point_clouds_dir}")
+            return o3d.geometry.PointCloud()
+        
+        logger.info(f"\nLoading {len(ply_files)} saved point clouds from disk...")
+        
+        point_clouds = []
+        loaded_count = 0
+        
+        for ply_file in ply_files:
+            try:
+                # Load point cloud from disk
+                pcd = o3d.io.read_point_cloud(str(ply_file))
+                
+                if len(pcd.points) > 0:
+                    point_clouds.append(pcd)
+                    loaded_count += 1
+                    if loaded_count % 10 == 0:
+                        logger.info(f"  Loaded {loaded_count}/{len(ply_files)} point clouds...")
+                else:
+                    logger.warning(f"  Empty point cloud in file: {ply_file.name}")
+                    
+            except Exception as e:
+                logger.error(f"  Failed to load point cloud {ply_file.name}: {e}")
+                continue
+        
+        logger.info(f"Successfully loaded {loaded_count} point clouds from disk")
+        
+        if point_clouds:
+            return self.merge_point_clouds(point_clouds)
+        else:
+            logger.error("No valid point clouds could be loaded from disk")
+            return o3d.geometry.PointCloud()
+    
     def run(self, 
             min_common_points: int = 100,
             min_baseline: float = 0.1,
@@ -1941,7 +1992,7 @@ class DenseMatchingPipeline:
             logger.info(f"  ... and {len(pairs) - 10} more pairs (use --single_pair INDEX to process a specific pair)")
         
         # Process each pair
-        point_clouds = []
+        successful_pairs = []  # Track successfully processed pairs instead of storing point clouds in memory
         total_start_time = time.time()
         total_pairs = len(pairs)
         
@@ -1975,7 +2026,8 @@ class DenseMatchingPipeline:
                                           multi_res=multi_res, pyramid_levels=pyramid_levels, debug=debug)
                 
                 if len(pcd.points) > 0:
-                    point_clouds.append(pcd)
+                    successful_pairs.append((img_id1, img_id2, len(pcd.points)))
+                    logger.info(f"  Successfully processed pair {i+1}: {len(pcd.points)} points saved to disk")
                 else:
                     logger.warning(f"  Empty point cloud generated for pair {i+1}")
                 
@@ -1989,10 +2041,11 @@ class DenseMatchingPipeline:
                 logger.error(f"  Failed to process pair {i+1}: {e}")
                 continue
         
-        # Merge point clouds
-        if point_clouds:
-            with self.profiler.profile("merge_point_clouds"):
-                merged_pcd = self.merge_point_clouds(point_clouds)
+        # Load and merge point clouds from disk
+        if successful_pairs:
+            logger.info(f"\n=== Loading and Merging Point Clouds ===")
+            with self.profiler.profile("load_and_merge_point_clouds"):
+                merged_pcd = self.load_and_merge_saved_point_clouds()
             
             # Save merged point cloud
             merged_path = self.output_dir / "merged_point_cloud.ply"
@@ -2001,9 +2054,14 @@ class DenseMatchingPipeline:
             total_time = time.time() - total_start_time
             logger.info(f"\n=== Pipeline Complete ===")
             logger.info(f"Total processing time: {total_time:.2f}s")
-            logger.info(f"Processed {len(point_clouds)} pairs successfully")
+            logger.info(f"Processed {len(successful_pairs)} pairs successfully")
             logger.info(f"Final merged point cloud: {len(merged_pcd.points)} points")
             logger.info(f"Saved to: {merged_path}")
+            
+            # Log total points from individual pairs (for comparison)
+            total_individual_points = sum(point_count for _, _, point_count in successful_pairs)
+            logger.info(f"Total points from individual pairs: {total_individual_points}")
+            logger.info(f"Points after merging/cleanup: {len(merged_pcd.points)} ({100*len(merged_pcd.points)/total_individual_points:.1f}% retained)")
             
             # Print profiling summary
             self.profiler.print_summary()
@@ -2082,7 +2140,7 @@ class DenseMatchingPipeline:
                 else:
                     f.write(f"Actual model resolution: Not determined yet\n")
                 f.write(f"\n")
-                f.write(f"Processed {len(point_clouds)} image pairs\n")
+                f.write(f"Processed {len(successful_pairs)} image pairs\n")
                 f.write(f"Final point cloud: {len(merged_pcd.points)} points\n")
                 f.write(f"Total processing time: {total_time:.2f}s\n\n")
                 
@@ -2115,12 +2173,12 @@ class DenseMatchingPipeline:
                 f.write(f"\n")
                 
                 f.write(f"Image pairs processed:\n")
-                for i, (img_id1, img_id2, point_count) in enumerate(self.point_cloud_metadata):
+                for i, (img_id1, img_id2, point_count) in enumerate(successful_pairs):
                     name1 = self.colmap_dataset.images[img_id1].name
                     name2 = self.colmap_dataset.images[img_id2].name
-                    f.write(f"  {i+1}. {name1} <-> {name2} {point_count}\n")
+                    f.write(f"  {i+1}. {name1} <-> {name2} ({point_count} points)\n")
         else:
-            logger.error("No point clouds generated!")
+            logger.error("No successful point clouds generated from any image pairs!")
 
 
 def main():

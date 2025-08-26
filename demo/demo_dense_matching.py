@@ -831,6 +831,127 @@ class DenseMatchingPipeline:
         
         return warp, certainty, info
     
+    def _create_image_pyramid(self, image_path: str, pyramid_levels: int) -> list[tuple[np.ndarray, int, int]]:
+        """
+        Create image pyramid with specified number of levels.
+        
+        Args:
+            image_path: Path to the image
+            pyramid_levels: Number of pyramid levels
+            
+        Returns:
+            List of tuples (image_array, width, height) for each pyramid level
+        """
+        pyramid = []
+        
+        # Load original image
+        orig_image = Image.open(image_path)
+        orig_w, orig_h = orig_image.size
+        
+        for level in range(pyramid_levels):
+            # Calculate dimensions for this level
+            scale_factor = 2 ** level
+            level_w = max(64, orig_w // scale_factor)  # Minimum width
+            level_h = max(64, orig_h // scale_factor)  # Minimum height
+            
+            # Resize image
+            if level == 0:
+                # Original resolution
+                level_image = orig_image
+            else:
+                level_image = orig_image.resize((level_w, level_h), Image.LANCZOS)
+            
+            # Convert to numpy array
+            level_image_np = np.array(level_image)
+            if len(level_image_np.shape) == 3:
+                level_image_np = level_image_np.transpose(2, 0, 1)  # HWC to CHW
+            else:
+                level_image_np = level_image_np[None, :]  # Add channel dimension for grayscale
+                
+            pyramid.append((level_image_np, level_w, level_h))
+            
+            logger.debug(f"  Pyramid level {level}: {level_w}x{level_h} (scale: 1/{scale_factor})")
+        
+        return pyramid
+    
+    def _scale_intrinsics(self, K: np.ndarray, original_size: tuple[int, int], 
+                         target_size: tuple[int, int]) -> np.ndarray:
+        """
+        Scale camera intrinsics matrix for different image resolutions.
+        
+        Args:
+            K: Original camera intrinsics matrix (3x3)
+            original_size: Original image size (width, height)
+            target_size: Target image size (width, height)
+            
+        Returns:
+            Scaled intrinsics matrix
+        """
+        orig_w, orig_h = original_size
+        target_w, target_h = target_size
+        
+        # Calculate scale factors
+        scale_x = target_w / orig_w
+        scale_y = target_h / orig_h
+        
+        # Scale the intrinsics
+        K_scaled = K.copy()
+        K_scaled[0, 0] *= scale_x  # fx
+        K_scaled[1, 1] *= scale_y  # fy
+        K_scaled[0, 2] *= scale_x  # cx
+        K_scaled[1, 2] *= scale_y  # cy
+        
+        return K_scaled
+    
+    def _merge_point_clouds(self, point_clouds: list[o3d.geometry.PointCloud]) -> o3d.geometry.PointCloud:
+        """
+        Merge multiple point clouds from different resolution levels.
+        
+        Args:
+            point_clouds: List of point clouds from different pyramid levels
+            
+        Returns:
+            Merged point cloud
+        """
+        if not point_clouds:
+            return o3d.geometry.PointCloud()
+        
+        # Start with the first cloud
+        merged_cloud = o3d.geometry.PointCloud()
+        all_points = []
+        all_colors = []
+        
+        for i, pcd in enumerate(point_clouds):
+            if len(pcd.points) > 0:
+                points = np.asarray(pcd.points)
+                all_points.append(points)
+                
+                if pcd.has_colors():
+                    colors = np.asarray(pcd.colors)
+                    all_colors.append(colors)
+                else:
+                    # Default color for points without color
+                    default_color = np.array([0.7, 0.7, 0.7])  # Gray
+                    colors = np.tile(default_color, (len(points), 1))
+                    all_colors.append(colors)
+        
+        if all_points:
+            # Combine all points and colors
+            merged_points = np.vstack(all_points)
+            merged_colors = np.vstack(all_colors) if all_colors else None
+            
+            # Create merged point cloud
+            merged_cloud.points = o3d.utility.Vector3dVector(merged_points)
+            if merged_colors is not None:
+                merged_cloud.colors = o3d.utility.Vector3dVector(merged_colors)
+            
+            # Remove duplicate points (points that are very close to each other)
+            merged_cloud = merged_cloud.voxel_down_sample(voxel_size=0.01)
+            
+            logger.info(f"  Merged {len(point_clouds)} pyramid levels into {len(merged_cloud.points)} points")
+        
+        return merged_cloud
+    
     def _grid_sample_points(self, valid_indices: torch.Tensor, certainty: torch.Tensor, 
                            base_threshold: float, max_points: int, grid_percentage: float,
                            max_threshold_multiplier: float, H: int, W: int) -> torch.Tensor:
@@ -1285,8 +1406,449 @@ class DenseMatchingPipeline:
         
         logger.info(f"  Saved visualizations: {vis_path.name}, {cert_path.name}")
     
+    def _process_pair_multires(self, img_id1: int, img_id2: int, pair_idx: int, 
+                              use_bbox_filter: bool = True, max_points: int = 100000,
+                              use_grid_sampling: bool = False, grid_percentage: float = 10.0, 
+                              max_threshold_multiplier: float = 5.0, pyramid_levels: int = 3,
+                              debug: bool = False) -> o3d.geometry.PointCloud:
+        """
+        Process a single image pair using multi-resolution approach.
+        
+        Args:
+            img_id1, img_id2: Image IDs to process
+            pair_idx: Index of this pair for logging
+            use_bbox_filter: Whether to filter points using scene bounding box
+            max_points: Maximum number of points to triangulate per pair (distributed across pyramid levels)
+            use_grid_sampling: Whether to use grid-based sampling
+            grid_percentage: Percentage for grid cells
+            max_threshold_multiplier: Maximum multiplier for certainty threshold
+            pyramid_levels: Number of pyramid levels
+            debug: Whether to save debug information
+            
+        Returns:
+            Merged point cloud from all pyramid levels
+        """
+        img_name1 = self.colmap_dataset.images[img_id1].name
+        img_name2 = self.colmap_dataset.images[img_id2].name
+        
+        # Get image paths
+        img_path1 = self.images_dir / img_name1
+        img_path2 = self.images_dir / img_name2
+        
+        logger.info(f"  Multi-resolution processing with {pyramid_levels} pyramid levels")
+        
+        # Create image pyramids
+        pyramid1 = self._create_image_pyramid(str(img_path1), pyramid_levels)
+        pyramid2 = self._create_image_pyramid(str(img_path2), pyramid_levels)
+        
+        # Get original camera information
+        info1 = self.colmap_dataset.get_image_info(img_id1)
+        info2 = self.colmap_dataset.get_image_info(img_id2)
+        K1_orig, K2_orig = info1['K'], info2['K']
+        
+        # Get original image dimensions
+        orig_w1, orig_h1 = get_image_dimensions(str(img_path1))
+        orig_w2, orig_h2 = get_image_dimensions(str(img_path2))
+        
+        point_clouds = []
+        
+        # Process each pyramid level
+        for level in range(pyramid_levels):
+            level_img1, level_w1, level_h1 = pyramid1[level]
+            level_img2, level_w2, level_h2 = pyramid2[level]
+            
+            # Calculate points for this level (max_points / 2^level)
+            level_max_points = max(10000, max_points // (2 ** level))
+            
+            logger.info(f"  Processing pyramid level {level}: {level_w1}x{level_h1}, {level_w2}x{level_h2} (max_points: {level_max_points})")
+            
+            # Scale camera intrinsics for this pyramid level
+            K1_scaled = self._scale_intrinsics(K1_orig, (orig_w1, orig_h1), (level_w1, level_h1))
+            K2_scaled = self._scale_intrinsics(K2_orig, (orig_w2, orig_h2), (level_w2, level_h2))
+            
+            if debug:
+                logger.info(f"    Intrinsics scaling for level {level}:")
+                logger.info(f"      Image 1: {orig_w1}x{orig_h1} -> {level_w1}x{level_h1}")
+                logger.info(f"      Original K1: fx={K1_orig[0,0]:.2f}, fy={K1_orig[1,1]:.2f}, cx={K1_orig[0,2]:.2f}, cy={K1_orig[1,2]:.2f}")
+                logger.info(f"      Scaled K1:   fx={K1_scaled[0,0]:.2f}, fy={K1_scaled[1,1]:.2f}, cx={K1_scaled[0,2]:.2f}, cy={K1_scaled[1,2]:.2f}")
+                logger.info(f"      Image 2: {orig_w2}x{orig_h2} -> {level_w2}x{level_h2}")
+                logger.info(f"      Original K2: fx={K2_orig[0,0]:.2f}, fy={K2_orig[1,1]:.2f}, cx={K2_orig[0,2]:.2f}, cy={K2_orig[1,2]:.2f}")
+                logger.info(f"      Scaled K2:   fx={K2_scaled[0,0]:.2f}, fy={K2_scaled[1,1]:.2f}, cx={K2_scaled[0,2]:.2f}, cy={K2_scaled[1,2]:.2f}")
+            
+            # Create temporary image info with scaled intrinsics
+            level_info1 = info1.copy()
+            level_info2 = info2.copy()
+            level_info1['K'] = K1_scaled
+            level_info2['K'] = K2_scaled
+            
+            try:
+                # Convert pyramid images to PIL format for matching
+                level_img1_pil = self._numpy_to_pil(level_img1)
+                level_img2_pil = self._numpy_to_pil(level_img2)
+                
+                # Perform dense matching at this resolution
+                warp, certainty, match_info = self._dense_match_images(
+                    level_img1_pil, level_img2_pil, level_w1, level_h1
+                )
+                
+                # Generate point cloud for this level with scaled intrinsics
+                level_pcd, _ = self._generate_point_cloud_with_intrinsics(
+                    warp, certainty, level_info1, level_info2, img_id1, img_id2,
+                    level_img1_pil, level_img2_pil, level_w1, level_h1, level_w2, level_h2,
+                    use_bbox_filter=use_bbox_filter, max_points=level_max_points,
+                    use_grid_sampling=use_grid_sampling, grid_percentage=grid_percentage,
+                    max_threshold_multiplier=max_threshold_multiplier, debug=debug
+                )
+                
+                if len(level_pcd.points) > 0:
+                    point_clouds.append(level_pcd)
+                    logger.info(f"    Level {level}: Generated {len(level_pcd.points)} points")
+                    
+                    # Save debug information if requested
+                    if debug:
+                        self._save_pyramid_debug_info(img_id1, img_id2, level, pair_idx, level_pcd, 
+                                                    level_img1_pil, level_img2_pil, 
+                                                    warp, certainty)
+                else:
+                    logger.warning(f"    Level {level}: No points generated")
+                
+            except Exception as e:
+                logger.error(f"    Level {level} failed: {str(e)}")
+                continue
+        
+        # Merge point clouds from all levels
+        if point_clouds:
+            # Add debug information about point cloud coordinates
+            if debug:
+                logger.info(f"  Debug: Point cloud coordinate ranges before merging:")
+                for level, pcd in enumerate(point_clouds):
+                    if len(pcd.points) > 0:
+                        points = np.asarray(pcd.points)
+                        min_coords = points.min(axis=0)
+                        max_coords = points.max(axis=0)
+                        mean_coords = points.mean(axis=0)
+                        logger.info(f"    Level {level}: {len(points)} points, "
+                                  f"X: [{min_coords[0]:.3f}, {max_coords[0]:.3f}] (mean: {mean_coords[0]:.3f}), "
+                                  f"Y: [{min_coords[1]:.3f}, {max_coords[1]:.3f}] (mean: {mean_coords[1]:.3f}), "
+                                  f"Z: [{min_coords[2]:.3f}, {max_coords[2]:.3f}] (mean: {mean_coords[2]:.3f})")
+            
+            merged_pcd = self._merge_point_clouds(point_clouds)
+            logger.info(f"  Multi-resolution result: {len(merged_pcd.points)} total points from {len(point_clouds)} levels")
+            
+            # Debug info for merged result
+            if debug and len(merged_pcd.points) > 0:
+                points = np.asarray(merged_pcd.points)
+                min_coords = points.min(axis=0)
+                max_coords = points.max(axis=0)
+                mean_coords = points.mean(axis=0)
+                logger.info(f"  Debug: Merged point cloud range: "
+                          f"X: [{min_coords[0]:.3f}, {max_coords[0]:.3f}] (mean: {mean_coords[0]:.3f}), "
+                          f"Y: [{min_coords[1]:.3f}, {max_coords[1]:.3f}] (mean: {mean_coords[1]:.3f}), "
+                          f"Z: [{min_coords[2]:.3f}, {max_coords[2]:.3f}] (mean: {mean_coords[2]:.3f})")
+            
+            return merged_pcd
+        else:
+            logger.warning(f"  No point clouds generated from any pyramid level")
+            return o3d.geometry.PointCloud()
+    
+    def _numpy_to_pil(self, img_array: np.ndarray) -> Image.Image:
+        """Convert numpy array to PIL Image."""
+        if len(img_array.shape) == 3:
+            # CHW to HWC
+            img_array = img_array.transpose(1, 2, 0)
+        elif len(img_array.shape) == 2:
+            # Grayscale
+            pass
+        else:
+            # Single channel case
+            img_array = img_array.squeeze()
+        
+        # Ensure uint8 format
+        if img_array.dtype != np.uint8:
+            img_array = (img_array * 255).astype(np.uint8)
+        
+        return Image.fromarray(img_array)
+    
+    def _pil_to_tensor(self, pil_image: Image.Image, target_w: int, target_h: int) -> torch.Tensor:
+        """
+        Convert PIL image to tensor suitable for RoMa model.
+        
+        Args:
+            pil_image: PIL Image to convert
+            target_w: Target width
+            target_h: Target height
+            
+        Returns:
+            Tensor in CHW format with values in [0, 1]
+        """
+        # Resize if needed
+        if pil_image.size != (target_w, target_h):
+            pil_image = pil_image.resize((target_w, target_h), Image.LANCZOS)
+        
+        # Convert to numpy array
+        img_array = np.array(pil_image, dtype=np.float32)
+        
+        # Handle grayscale images
+        if len(img_array.shape) == 2:
+            img_array = np.stack([img_array] * 3, axis=-1)  # Convert to RGB
+        
+        # Convert from HWC to CHW and normalize to [0, 1]
+        img_tensor = torch.from_numpy(img_array.transpose((2, 0, 1)) / 255.0)
+        
+        return img_tensor
+    
+    def _dense_match_images(self, img1_pil: Image.Image, img2_pil: Image.Image, 
+                           target_w: int, target_h: int) -> tuple[torch.Tensor, torch.Tensor, dict]:
+        """
+        Perform dense matching on two PIL images at specified resolution.
+        """
+        # Convert PIL images to tensors using our own method
+        img1_tensor = self._pil_to_tensor(img1_pil, target_w, target_h)
+        img2_tensor = self._pil_to_tensor(img2_pil, target_w, target_h)
+        
+        # Stack images for batch processing
+        imgs = torch.stack([img1_tensor, img2_tensor], dim=0).to(device)
+        
+        # Perform matching
+        with torch.no_grad():
+            warp, certainty = self.roma_model.match(imgs[0][None], imgs[1][None])
+            
+        # Squeeze batch dimension
+        warp = warp.squeeze(0).cpu()
+        certainty = certainty.squeeze(0).cpu()
+        
+        # Calculate statistics
+        mean_certainty = torch.mean(certainty).item()
+        high_conf_ratio = torch.sum(certainty > 0.3).float() / certainty.numel()
+        
+        info = {
+            'mean_certainty': mean_certainty,
+            'high_conf_ratio': high_conf_ratio.item()
+        }
+        
+        return warp, certainty, info
+    
+    def _generate_point_cloud_with_intrinsics(self, warp: torch.Tensor, certainty: torch.Tensor,
+                                            info1: dict, info2: dict, img_id1: int, img_id2: int,
+                                            img1_pil: Image.Image, img2_pil: Image.Image,
+                                            W1: int, H1: int, W2: int, H2: int,
+                                            use_bbox_filter: bool = True, max_points: int = 100000,
+                                            use_grid_sampling: bool = False, grid_percentage: float = 10.0,
+                                            max_threshold_multiplier: float = 5.0, debug: bool = False) -> tuple[o3d.geometry.PointCloud, np.ndarray]:
+        """
+        Generate point cloud using custom intrinsics (for scaled pyramid levels).
+        """
+        logger.info(f"Generating point cloud for pyramid level {img_id1}-{img_id2}")
+        
+        # Get camera information from provided info
+        K1, K2 = info1['K'], info2['K']
+        R_rel, t_rel = self.colmap_dataset.get_relative_pose(img_id1, img_id2)
+        
+        # Debug: Log initial parameters
+        if debug:
+            logger.info(f"    Pyramid level triangulation parameters:")
+            logger.info(f"      Image sizes: {W1}x{H1}, {W2}x{H2}")
+            logger.info(f"      Certainty threshold: {0.3}")
+            logger.info(f"      Min triangulation angle: {self.min_triangulation_angle}°")
+        
+        # Convert PIL images to numpy for triangulation
+        img1_np = np.array(img1_pil)
+        img2_np = np.array(img2_pil)
+        if len(img1_np.shape) == 3:
+            img1_np = img1_np.transpose(2, 0, 1)  # HWC to CHW
+        else:
+            img1_np = img1_np[None, :]  # Add channel dimension
+        if len(img2_np.shape) == 3:
+            img2_np = img2_np.transpose(2, 0, 1)  # HWC to CHW  
+        else:
+            img2_np = img2_np[None, :]  # Add channel dimension
+        
+        # Sample high-certainty correspondences
+        certainty_threshold = 0.3  # Fixed threshold for pyramid levels
+        mask = certainty > certainty_threshold
+        valid_indices = torch.nonzero(mask, as_tuple=False)
+        
+        H, W = certainty.shape
+        if len(valid_indices) > max_points:
+            if use_grid_sampling:
+                # Grid-based sampling for more even distribution
+                valid_indices = self._grid_sample_points(
+                    valid_indices, certainty, certainty_threshold, 
+                    max_points, grid_percentage, max_threshold_multiplier, H, W
+                )
+            else:
+                # Randomly sample points (original behavior)
+                perm = torch.randperm(len(valid_indices))[:max_points]
+                valid_indices = valid_indices[perm]
+        
+        logger.info(f"  Triangulating {len(valid_indices)} points")
+        
+        # Extract correspondences
+        y_coords, x_coords = valid_indices[:, 0], valid_indices[:, 1]
+        
+        # Points in image 1 (pixel coordinates)
+        kpts1 = torch.stack([x_coords, y_coords], dim=1).float()
+        
+        # Corresponding points in image 2 from warp
+        warp_coords = warp[y_coords, x_coords, 2:4]  # Get the second image coordinates
+        
+        # Convert from normalized coordinates to pixel coordinates
+        kpts2_x = W * (warp_coords[:, 0] + 1) / 2
+        kpts2_y = H * (warp_coords[:, 1] + 1) / 2
+        kpts2 = torch.stack([kpts2_x, kpts2_y], dim=1)
+        
+        # Convert to numpy
+        kpts1_np = kpts1.numpy()
+        kpts2_np = kpts2.numpy()
+        
+        logger.info(f"  Key points: Image 1: {kpts1_np.shape}, Image 2: {kpts2_np.shape}")
+        
+        # Triangulate points
+        with self.profiler.profile("triangulation"):
+            points_3d_cam1 = triangulate_points(
+                kpts1_np, kpts2_np, K1, K2, R_rel, t_rel
+            )
+        
+        # Filter points
+        with self.profiler.profile("point_filtering"):
+            # Convert to world coordinates for filtering (triangulated points are in camera 1 coordinates)
+            # Get relative pose and transform to world coordinates
+            cam_center1 = self.colmap_dataset.images[img_id1].projection_center()
+            cam_center2 = self.colmap_dataset.images[img_id2].projection_center()
+            
+            # Transform points from camera 1 coordinates to world coordinates
+            R1, t1 = self.colmap_dataset.get_pose(img_id1)
+            
+            # COLMAP uses cam_from_world: X_cam = R @ X_world + t
+            # So to transform from camera to world: X_world = R^T @ (X_cam - t)
+            t1_flat = t1.flatten()  # Ensure t1 is 1D for broadcasting
+            points_3d_world = (R1.T @ (points_3d_cam1 - t1_flat).T).T
+            
+            # Apply triangulation angle filtering first (more important than bbox)
+            with self.profiler.profile("triangulation_angle_filtering"):
+                if len(points_3d_world) > 0:
+                    # Get camera centers for triangulation angle calculation
+                    rays1 = points_3d_world - cam_center1
+                    rays2 = points_3d_world - cam_center2
+                    
+                    # Normalize rays
+                    rays1_norm = rays1 / np.linalg.norm(rays1, axis=1, keepdims=True)
+                    rays2_norm = rays2 / np.linalg.norm(rays2, axis=1, keepdims=True)
+                    
+                    # Compute triangulation angles
+                    cos_angles = np.sum(rays1_norm * rays2_norm, axis=1)
+                    cos_angles = np.clip(cos_angles, -1.0, 1.0)
+                    
+                    # Convert to degrees (triangulation angle = 180° - angle between rays)
+                    angles_rad = np.arccos(np.abs(cos_angles))
+                    angles_deg = np.degrees(angles_rad)
+                    
+                    # Filter points with sufficient triangulation angle
+                    valid_angle_mask = angles_deg >= self.min_triangulation_angle
+                    
+                    points_3d_world = points_3d_world[valid_angle_mask]
+                    kpts1_np = kpts1_np[valid_angle_mask]
+                    
+                    logger.info(f"  After triangulation angle filtering: {len(points_3d_world)} points (min angle: {self.min_triangulation_angle}°)")
+            
+            # Apply depth filtering (remove points too close or too far)
+            with self.profiler.profile("depth_filtering"):
+                if len(points_3d_world) > 0:
+                    depths = np.linalg.norm(points_3d_world, axis=1)
+                    valid_depth_mask = (depths > 0.1) & (depths < 100)
+                    
+                    points_3d_world = points_3d_world[valid_depth_mask]
+                    kpts1_np = kpts1_np[valid_depth_mask]
+                    
+                    logger.info(f"  After depth filtering: {len(points_3d_world)} points")
+            
+            # Apply bounding box filtering
+            if use_bbox_filter and hasattr(self.colmap_dataset, 'scene_bounds') and len(points_3d_world) > 0:
+                bbox_min, bbox_max = self.colmap_dataset.scene_bounds
+                bbox_filter = (
+                    (points_3d_world[:, 0] >= bbox_min[0]) & (points_3d_world[:, 0] <= bbox_max[0]) &
+                    (points_3d_world[:, 1] >= bbox_min[1]) & (points_3d_world[:, 1] <= bbox_max[1]) &
+                    (points_3d_world[:, 2] >= bbox_min[2]) & (points_3d_world[:, 2] <= bbox_max[2])
+                )
+                
+                points_3d_world = points_3d_world[bbox_filter]
+                kpts1_np = kpts1_np[bbox_filter]
+                
+                logger.info(f"  After bbox filtering: {len(points_3d_world)} points")
+            
+            # Convert back to camera coordinates for color extraction if needed
+            # Transform: cam1_point = R1 @ world_point + t1
+            if len(points_3d_world) > 0:
+                points_3d_cam1 = (R1 @ points_3d_world.T + t1_flat.reshape(-1, 1)).T
+            else:
+                points_3d_cam1 = points_3d_world  # Empty array
+        
+        # Extract colors for points
+        with self.profiler.profile("color_extraction"):
+            if len(points_3d_world) > 0 and len(kpts1_np) > 0:
+                if len(img1_np.shape) == 3 and img1_np.shape[0] >= 3:
+                    # RGB image - ensure indices are valid
+                    y_indices = np.clip(kpts1_np[:, 1].astype(int), 0, img1_np.shape[1] - 1)
+                    x_indices = np.clip(kpts1_np[:, 0].astype(int), 0, img1_np.shape[2] - 1)
+                    colors = img1_np[:3, y_indices, x_indices].T / 255.0
+                else:
+                    # Grayscale - use gray color
+                    colors = np.full((len(points_3d_world), 3), 0.5)
+            else:
+                colors = np.empty((0, 3))
+        
+        # Create point cloud using world coordinates
+        pcd = o3d.geometry.PointCloud()
+        if len(points_3d_world) > 0:
+            pcd.points = o3d.utility.Vector3dVector(points_3d_world)
+            pcd.colors = o3d.utility.Vector3dVector(colors)
+        
+        # Generate depth map (optional, return None for pyramid levels)
+        depth_map = None
+        
+        return pcd, depth_map
+    
+    def _save_pyramid_debug_info(self, img_id1: int, img_id2: int, level: int, pair_idx: int,
+                                pcd: o3d.geometry.PointCloud, img1_pil: Image.Image, img2_pil: Image.Image,
+                                warp: torch.Tensor, certainty: torch.Tensor):
+        """
+        Save debug information for pyramid levels.
+        """
+        # Create structured debug directory: debug/pair_XX/resY/
+        debug_dir = self.output_dir / "debug" / f"pair_{pair_idx:02d}" / f"res{level}"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Save point cloud
+        pcd_path = debug_dir / f"cloud_{img_id1}_{img_id2}.ply"
+        o3d.io.write_point_cloud(str(pcd_path), pcd)
+        
+        # Save pyramid level images
+        img1_path = debug_dir / f"img1_{img_id1}.jpg"
+        img2_path = debug_dir / f"img2_{img_id2}.jpg"
+        img1_pil.save(img1_path)
+        img2_pil.save(img2_path)
+        
+        # Save certainty map
+        cert_path = debug_dir / f"certainty_{img_id1}_{img_id2}.jpg"
+        certainty_vis = torch.stack([certainty, certainty, certainty], dim=0)
+        tensor_to_pil(certainty_vis, unnormalize=False).save(cert_path)
+        
+        # Save resolution info
+        info_path = debug_dir / "resolution_info.txt"
+        with open(info_path, 'w') as f:
+            f.write(f"Resolution Level: {level}\n")
+            f.write(f"Image 1 size: {img1_pil.size}\n")
+            f.write(f"Image 2 size: {img2_pil.size}\n")
+            f.write(f"Point cloud points: {len(pcd.points)}\n")
+            f.write(f"Certainty shape: {certainty.shape}\n")
+            f.write(f"Warp shape: {warp.shape}\n")
+            f.write(f"Mean certainty: {torch.mean(certainty).item():.4f}\n")
+        
+        logger.info(f"  Saved debug info for level {level}: {debug_dir.relative_to(self.output_dir)}")
+    
     def process_pair(self, img_id1: int, img_id2: int, pair_idx: int, use_bbox_filter: bool = True, max_points: int = 100000,
-                     use_grid_sampling: bool = False, grid_percentage: float = 10.0, max_threshold_multiplier: float = 5.0) -> o3d.geometry.PointCloud:
+                     use_grid_sampling: bool = False, grid_percentage: float = 10.0, max_threshold_multiplier: float = 5.0,
+                     multi_res: bool = False, pyramid_levels: int = 3, debug: bool = False) -> o3d.geometry.PointCloud:
         """
         Process a single image pair and return point cloud.
         
@@ -1298,10 +1860,21 @@ class DenseMatchingPipeline:
             use_grid_sampling: Whether to use grid-based sampling instead of random sampling
             grid_percentage: Percentage of image to use for each grid cell (e.g., 10.0 means 10% => 10x10 grid)
             max_threshold_multiplier: Maximum multiplier for certainty_threshold when grid cells have insufficient points
+            multi_res: Whether to use multi-resolution processing
+            pyramid_levels: Number of pyramid levels for multi-resolution
+            debug: Whether to save debug information
             
         Returns:
             Point cloud generated from the image pair
         """
+        
+        # Route to multi-resolution processing if enabled
+        if multi_res:
+            return self._process_pair_multires(
+                img_id1, img_id2, pair_idx, use_bbox_filter, max_points,
+                use_grid_sampling, grid_percentage, max_threshold_multiplier,
+                pyramid_levels, debug
+            )
         
         # Dense matching
         warp, certainty, match_info = self.dense_match_pair(img_id1, img_id2)
@@ -1430,7 +2003,11 @@ class DenseMatchingPipeline:
             pairs_file: str = "pairs.json",
             use_grid_sampling: bool = False,
             grid_percentage: float = 10.0,
-            max_threshold_multiplier: float = 5.0):
+            max_threshold_multiplier: float = 5.0,
+            multi_res: bool = False,
+            pyramid_levels: int = 3,
+            debug: bool = False,
+            single_pair: int = None):
         """
         Run the complete dense matching pipeline.
         
@@ -1445,6 +2022,10 @@ class DenseMatchingPipeline:
             use_grid_sampling: Whether to use grid-based sampling instead of random sampling
             grid_percentage: Percentage of image to use for each grid cell (e.g., 10.0 means 10% => 10x10 grid)
             max_threshold_multiplier: Maximum multiplier for certainty_threshold when grid cells have insufficient points
+            multi_res: Whether to use multi-resolution processing with image pyramids
+            pyramid_levels: Number of pyramid levels for multi-resolution processing
+            debug: Whether to save debug information for pyramid levels
+            single_pair: Index of specific pair to process (0-based). If None, processes all pairs.
         """
         logger.info("=== Starting Dense Matching Pipeline ===")
         
@@ -1467,21 +2048,50 @@ class DenseMatchingPipeline:
             logger.error("No suitable image pairs found!")
             return
         
+        # Show available pairs for debugging
+        logger.info(f"Found {len(pairs)} suitable image pairs:")
+        for idx, (id1, id2, meta) in enumerate(pairs[:10]):  # Show first 10 pairs
+            img1_name = self.colmap_dataset.images[id1].name
+            img2_name = self.colmap_dataset.images[id2].name
+            logger.info(f"  [{idx}] {img1_name} <-> {img2_name} "
+                       f"(baseline: {meta['baseline']:.3f}, "
+                       f"common_points: {meta['common_points']})")
+        if len(pairs) > 10:
+            logger.info(f"  ... and {len(pairs) - 10} more pairs (use --single_pair INDEX to process a specific pair)")
+        
         # Process each pair
         point_clouds = []
         total_start_time = time.time()
         total_pairs = len(pairs)
         
+        # Limit to single pair for debugging if requested
+        if single_pair is not None:
+            if single_pair < 0 or single_pair >= len(pairs):
+                logger.error(f"Invalid pair index {single_pair}. Available pairs: 0-{len(pairs)-1}")
+                return
+            
+            selected_pair = pairs[single_pair]
+            pairs = [selected_pair]
+            total_pairs = 1
+            img_name1 = self.colmap_dataset.images[selected_pair[0]].name
+            img_name2 = self.colmap_dataset.images[selected_pair[1]].name
+            logger.info(f"=== DEBUG MODE: Processing only pair {single_pair}: {img_name1} <-> {img_name2} ===")
+        
         for i, (img_id1, img_id2, metadata) in enumerate(pairs):
             try:
                 img_name1 = self.colmap_dataset.images[img_id1].name
                 img_name2 = self.colmap_dataset.images[img_id2].name
+                
+                # Use the correct pair index for debug purposes
+                actual_pair_idx = single_pair if single_pair is not None else i
+                
                 logger.info(f"\n=== Processing pair {i+1}/{total_pairs}: {img_id1} ({img_name1}) <-> {img_id2} ({img_name2}) ===")
                 
                 with self.profiler.profile("process_single_pair"):
-                    pcd = self.process_pair(img_id1, img_id2, i, use_bbox_filter=use_bbox_filter, max_points=max_points,
+                    pcd = self.process_pair(img_id1, img_id2, actual_pair_idx, use_bbox_filter=use_bbox_filter, max_points=max_points,
                                           use_grid_sampling=use_grid_sampling, grid_percentage=grid_percentage,
-                                          max_threshold_multiplier=max_threshold_multiplier)
+                                          max_threshold_multiplier=max_threshold_multiplier,
+                                          multi_res=multi_res, pyramid_levels=pyramid_levels, debug=debug)
                 
                 if len(pcd.points) > 0:
                     point_clouds.append(pcd)
@@ -1686,6 +2296,16 @@ def main():
     parser.add_argument("--max_threshold_multiplier", type=float, default=None,
                        help="Maximum multiplier for certainty threshold when grid cells have insufficient points (default: 5.0)")
     
+    # Multi-resolution options
+    parser.add_argument("--multi_res", action="store_true",
+                       help="Enable multi-resolution processing using image pyramids")
+    parser.add_argument("--pyramid_levels", type=int, default=None,
+                       help="Number of pyramid levels for multi-resolution processing (default: 3)")
+    parser.add_argument("--debug", action="store_true",
+                       help="Enable debug mode to save individual resolution point clouds and images")
+    parser.add_argument("--single_pair", type=int, default=None,
+                       help="Process only the specified pair index (0-based) for debugging purposes. If not set, processes all pairs.")
+    
     args = parser.parse_args()
     
     # Handle special commands
@@ -1738,7 +2358,11 @@ def main():
         'cache_size': 100,
         'use_grid_sampling': False,
         'grid_percentage': 10.0,
-        'max_threshold_multiplier': 5.0
+        'max_threshold_multiplier': 5.0,
+        'multi_res': False,
+        'pyramid_levels': 3,
+        'debug': False,
+        'single_pair': None
     }
     
     for key, default_value in defaults.items():
@@ -1857,7 +2481,11 @@ def main():
         pairs_file=config['pairs_file'],
         use_grid_sampling=config['use_grid_sampling'],
         grid_percentage=config['grid_percentage'],
-        max_threshold_multiplier=config['max_threshold_multiplier']
+        max_threshold_multiplier=config['max_threshold_multiplier'],
+        multi_res=config['multi_res'],
+        pyramid_levels=config['pyramid_levels'],
+        debug=config['debug'],
+        single_pair=config['single_pair']
     )
 
 

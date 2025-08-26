@@ -715,13 +715,65 @@ class DenseMatchingPipeline:
         
         return warp, certainty, info
     
+    def _compute_safe_pyramid_levels(self, image_width: int, image_height: int, max_levels: int = 5) -> int:
+        """
+        Compute safe number of pyramid levels to avoid downsampling below model output resolution.
+        
+        Args:
+            image_width: Original image width
+            image_height: Original image height  
+            max_levels: Maximum number of levels to consider (default: 5)
+            
+        Returns:
+            Number of safe pyramid levels
+        """
+        # Get model output resolution as minimum threshold
+        try:
+            # First try to use cached actual resolution if available
+            if self.actual_resolution is not None:
+                model_h, model_w = self.actual_resolution  # Already in (H, W) format
+                min_width, min_height = model_w * 0.75, model_h * 0.75
+                logger.info(f"  Using cached model resolution as threshold: {min_width:.0f}x{min_height:.0f}")
+            elif hasattr(self.roma_model, 'get_output_resolution'):
+                model_h, model_w = self.roma_model.get_output_resolution()  # Returns (H, W)
+                min_width, min_height = model_w * 0.75, model_h * 0.75
+                logger.info(f"  Using model output resolution as threshold: {min_width:.0f}x{min_height:.0f}")
+            else:
+                # Fallback for models without get_output_resolution (like tiny_roma before first match)
+                min_width, min_height = 256, 256
+                logger.info(f"  Model resolution not available, using fallback: {min_width}x{min_height}")
+        except Exception as e:
+            # Fallback in case of any errors
+            min_width, min_height = 256, 256
+            logger.warning(f"  Error getting model resolution ({e}), using fallback: {min_width}x{min_height}")
+        
+        safe_levels = 1  # At least include original resolution (level 0)
+        
+        for level in range(1, max_levels):
+            scale_factor = 2 ** level
+            level_w = image_width // scale_factor
+            level_h = image_height // scale_factor
+            
+            # Check if this level would go below model output resolution
+            if level_w < min_width or level_h < min_height:
+                logger.info(f"  Stopping at level {level-1}: next level {level_w}x{level_h} would be below model output resolution")
+                break
+            
+            safe_levels = level + 1
+            logger.debug(f"  Level {level} safe: {level_w}x{level_h}")
+        
+        logger.info(f"  Computed safe pyramid levels: {safe_levels} (requested: {max_levels})")
+        return safe_levels
+    
+
+    
     def _create_image_pyramid(self, image_path: str, pyramid_levels: int) -> list[tuple[np.ndarray, int, int]]:
         """
-        Create image pyramid with specified number of levels.
+        Create image pyramid with safe number of levels to avoid downsampling below model output resolution.
         
         Args:
             image_path: Path to the image
-            pyramid_levels: Number of pyramid levels
+            pyramid_levels: Requested number of pyramid levels (will be limited by safe levels)
             
         Returns:
             List of tuples (image_array, width, height) for each pyramid level
@@ -732,7 +784,16 @@ class DenseMatchingPipeline:
         orig_image = Image.open(image_path)
         orig_w, orig_h = orig_image.size
         
-        for level in range(pyramid_levels):
+        # Compute safe number of levels to avoid going below model output resolution
+        safe_levels = self._compute_safe_pyramid_levels(orig_w, orig_h, pyramid_levels)
+        
+        # Use the minimum of requested levels and safe levels
+        actual_levels = min(pyramid_levels, safe_levels)
+        
+        if actual_levels < pyramid_levels:
+            logger.info(f"  Limited pyramid levels from {pyramid_levels} to {actual_levels} to respect model output resolution")
+        
+        for level in range(actual_levels):
             # Calculate dimensions for this level
             scale_factor = 2 ** level
             level_w = max(64, orig_w // scale_factor)  # Minimum width
@@ -1300,11 +1361,17 @@ class DenseMatchingPipeline:
         img_path1 = self.images_dir / img_name1
         img_path2 = self.images_dir / img_name2
         
-        logger.info(f"  Multi-resolution processing with {pyramid_levels} pyramid levels")
+        logger.info(f"  Multi-resolution processing with {pyramid_levels} requested pyramid levels")
         
-        # Create image pyramids
+        # Create image pyramids (may be limited by model output resolution)
         pyramid1 = self._create_image_pyramid(str(img_path1), pyramid_levels)
         pyramid2 = self._create_image_pyramid(str(img_path2), pyramid_levels)
+        
+        # Use actual number of levels created (may be less than requested)
+        actual_levels = len(pyramid1)
+        
+        if actual_levels != pyramid_levels:
+            logger.info(f"  Using {actual_levels} actual pyramid levels (limited from {pyramid_levels} requested to respect model output resolution)")
         
         # Get original camera information
         info1 = self.colmap_dataset.get_image_info(img_id1)
@@ -1317,8 +1384,8 @@ class DenseMatchingPipeline:
         
         point_clouds = []
         
-        # Process each pyramid level
-        for level in range(pyramid_levels):
+        # Process each pyramid level (use actual levels, not requested levels)
+        for level in range(actual_levels):
             level_img1, level_w1, level_h1 = pyramid1[level]
             level_img2, level_w2, level_h2 = pyramid2[level]
             

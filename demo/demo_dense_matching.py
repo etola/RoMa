@@ -183,7 +183,7 @@ def create_example_config(output_path: str):
         "disable_bbox_filter": False,
         "min_triangulation_angle": 2.0,
         "enable_visualizations": False,
-        "disable_prescaling": False,
+
         "cache_size": 100
     }
     
@@ -366,21 +366,17 @@ def get_image_dimensions(image_path: str) -> Tuple[int, int]:
 def get_image_for_model(image_path: str, 
                        model_type: str,
                        image_cache: 'ImageCache',
-                       scaled_images_dir: Path = None,
-                       enable_prescaling: bool = True,
                        target_size: Tuple[int, int] = None,
                        as_numpy: bool = False) -> Image.Image:
     """
     Get image loaded and sized appropriately for the specified model type.
-    Handles all the complex logic around pre-scaled images, caching, etc.
+    Handles caching for efficient image loading and resizing.
     
     Args:
         image_path: Path to original image file
         model_type: "roma_outdoor", "roma_indoor", or "tiny_roma"
         image_cache: ImageCache instance for caching
-        scaled_images_dir: Directory containing pre-scaled images (for tiny_roma)
-        enable_prescaling: Whether to use pre-scaled images (for tiny_roma)
-        target_size: (width, height) for final image size (for roma models)
+        target_size: (width, height) for final image size
         as_numpy: Return as numpy array instead of PIL Image
         
     Returns:
@@ -396,20 +392,7 @@ def get_image_for_model(image_path: str,
             return image_cache.get_image(image_path, width, height, as_numpy=as_numpy)
     
     elif model_type == "tiny_roma":
-        # For tiny_roma, check for pre-scaled images first
-        if enable_prescaling and scaled_images_dir is not None:
-            image_filename = Path(image_path).name
-            scaled_path = scaled_images_dir / image_filename
-            
-            if scaled_path.exists():
-                # Use pre-scaled image (possibly with additional resizing if target_size specified)
-                if target_size is None:
-                    return image_cache.get_image(str(scaled_path), as_numpy=as_numpy)
-                else:
-                    width, height = target_size
-                    return image_cache.get_image(str(scaled_path), width, height, as_numpy=as_numpy)
-        
-        # Fallback to original image
+        # For tiny_roma, use original images with caching
         if target_size is None:
             return image_cache.get_image(image_path, as_numpy=as_numpy)
         else:
@@ -420,19 +403,7 @@ def get_image_for_model(image_path: str,
         raise ValueError(f"Unknown model type: {model_type}")
 
 
-def get_prescaled_image_path(image_path: str, scaled_images_dir: Path) -> Path:
-    """
-    Get the path to the pre-scaled version of an image.
-    
-    Args:
-        image_path: Path to original image
-        scaled_images_dir: Directory containing pre-scaled images
-        
-    Returns:
-        Path to pre-scaled image
-    """
-    image_filename = Path(image_path).name
-    return scaled_images_dir / image_filename
+
 
 
 def generate_depth_map_from_camera_coordinates(points_3d_cam1: np.ndarray,
@@ -506,7 +477,6 @@ class DenseMatchingPipeline:
                  resolution: Tuple[int, int] = (864, 1152),
                  min_triangulation_angle: float = 2.0,
                  save_visualizations: bool = False,
-                 enable_prescaling: bool = True,
                  command_args: Optional[Dict] = None,
                  cache_size: int = 100,
                  include_cameras_in_bbox: bool = False,
@@ -523,7 +493,7 @@ class DenseMatchingPipeline:
             resolution: Target resolution for matching
             min_triangulation_angle: Minimum triangulation angle in degrees
             save_visualizations: Whether to save match visualizations (default: False)
-            enable_prescaling: Pre-scale images for tiny_roma model (speeds up processing)
+
             command_args: Dictionary of command line arguments used to call the program
             cache_size: Maximum number of cached image variants (higher = faster but more memory)
             include_cameras_in_bbox: Whether to include camera centers in scene bounding box computation
@@ -588,79 +558,9 @@ class DenseMatchingPipeline:
         # Scene bounding box (computed once)
         self.scene_bbox = None
         
-        # Scaled images directory for tiny model optimization
-        self.scaled_images_dir = self.output_dir / "scaled_images"
-        
-        # Pre-scale images if using tiny model (optimization)
-        self.enable_prescaling = enable_prescaling
-        if self.model_type == "tiny_roma" and self.enable_prescaling:
-            self._prescale_images_for_tiny_model()
+
     
-    def _prescale_images_for_tiny_model(self):
-        """
-        Pre-scale all images for tiny RoMa model to avoid repeated resizing.
-        Images are saved to scaled_images/ directory with the same filenames.
-        """
-        logger.info("Pre-scaling images for tiny RoMa model...")
-        
-        # Create scaled images directory
-        self.scaled_images_dir.mkdir(exist_ok=True)
-        
-        max_size = 800  # Same as used in dense_match_pair
-        
-        # Resize function (same as in dense_match_pair)
-        def resize_with_max_size(img, max_size):
-            w, h = img.size
-            if max(w, h) > max_size:
-                if w > h:
-                    new_w, new_h = max_size, int(h * max_size / w)
-                else:
-                    new_w, new_h = int(w * max_size / h), max_size
-                return img.resize((new_w, new_h))
-            return img
-        
-        # Process all images in the dataset
-        processed_count = 0
-        skipped_count = 0
-        
-        for img_id, image in self.colmap_dataset.images.items():
-            img_name = image.name
-            original_path = Path(self.images_dir) / img_name
-            scaled_path = self.scaled_images_dir / img_name
-            
-            # Skip if already exists and is newer than original
-            if scaled_path.exists() and scaled_path.stat().st_mtime > original_path.stat().st_mtime:
-                skipped_count += 1
-                continue
-            
-            try:
-                # Load original image using cache
-                img = self.image_cache.get_image(str(original_path))
-                
-                # Calculate target dimensions
-                w, h = img.size
-                if max(w, h) > max_size:
-                    if w > h:
-                        new_w, new_h = max_size, int(h * max_size / w)
-                    else:
-                        new_w, new_h = int(w * max_size / h), max_size
-                    
-                    # Get resized image from cache
-                    img_resized = self.image_cache.get_image(str(original_path), new_w, new_h)
-                else:
-                    img_resized = img
-                
-                # Save scaled image
-                img_resized.save(scaled_path, quality=95)
-                processed_count += 1
-                
-                if processed_count % 10 == 0:
-                    logger.info(f"  Processed {processed_count} images...")
-                    
-            except Exception as e:
-                logger.warning(f"  Failed to scale image {img_name}: {e}")
-        
-        logger.info(f"Pre-scaling complete: {processed_count} processed, {skipped_count} skipped (already up-to-date)")
+
         
     def select_image_pairs(self, 
                           min_common_points: int = 100,
@@ -753,70 +653,44 @@ class DenseMatchingPipeline:
                 warp, certainty = self.roma_model.match(str(img_path1), str(img_path2), device=device)
             
         else:  # tiny_roma
-            # Check for pre-scaled images first
-            scaled_path1 = get_prescaled_image_path(str(img_path1), self.scaled_images_dir)
-            scaled_path2 = get_prescaled_image_path(str(img_path2), self.scaled_images_dir)
+            # Resize on the fly using unified function
+            max_size = 800  # Limit maximum dimension to control memory usage
             
-            if (self.enable_prescaling and scaled_path1.exists() and scaled_path2.exists()):
-                # Use pre-scaled images - much faster!
-                logger.info(f"  Using pre-scaled images from {self.scaled_images_dir.name}/")
-                with self.profiler.profile("tiny_roma_model_inference"):
-                    warp, certainty = self.roma_model.match(str(scaled_path1), str(scaled_path2))
+            with self.profiler.profile("image_loading_and_resize"):
+                # Get original image dimensions efficiently
+                orig_w1, orig_h1 = get_image_dimensions(str(img_path1))
+                orig_w2, orig_h2 = get_image_dimensions(str(img_path2))
                 
-                # Get image dimensions for logging (efficient version)
-                with self.profiler.profile("image_loading_tiny_roma"):
-                    img1_size = get_image_dimensions(str(scaled_path1))
-                    img2_size = get_image_dimensions(str(scaled_path2))
+                # Calculate target sizes while maintaining aspect ratio
+                def get_resized_dimensions(w, h, max_size):
+                    if max(w, h) > max_size:
+                        if w > h:
+                            return max_size, int(h * max_size / w)
+                        else:
+                            return int(w * max_size / h), max_size
+                    return w, h
                 
-                H, W = warp.shape[:2]
-                # Store actual resolution for tiny_roma on first match
-                if self.actual_resolution is None:
-                    self.actual_resolution = (H, W)
-                logger.info(f"  Warp shape: {warp.shape}")
-                logger.info(f"  Certainty shape: {certainty.shape}")
-                logger.info(f"  Scaled image 1: {img1_size}")
-                logger.info(f"  Scaled image 2: {img2_size}")
+                new_w1, new_h1 = get_resized_dimensions(orig_w1, orig_h1, max_size)
+                new_w2, new_h2 = get_resized_dimensions(orig_w2, orig_h2, max_size)
                 
-            else:
-                # Fallback: resize on the fly using unified function
-                logger.warning(f"  Pre-scaled images not found, resizing on the fly...")
-                max_size = 800  # Limit maximum dimension to control memory usage
-                
-                with self.profiler.profile("image_loading_and_resize_fallback"):
-                    # Get original image dimensions efficiently
-                    orig_w1, orig_h1 = get_image_dimensions(str(img_path1))
-                    orig_w2, orig_h2 = get_image_dimensions(str(img_path2))
-                    
-                    # Calculate target sizes while maintaining aspect ratio
-                    def get_resized_dimensions(w, h, max_size):
-                        if max(w, h) > max_size:
-                            if w > h:
-                                return max_size, int(h * max_size / w)
-                            else:
-                                return int(w * max_size / h), max_size
-                        return w, h
-                    
-                    new_w1, new_h1 = get_resized_dimensions(orig_w1, orig_h1, max_size)
-                    new_w2, new_h2 = get_resized_dimensions(orig_w2, orig_h2, max_size)
-                    
-                    # Get resized images using unified function
-                    img1_resized = get_image_for_model(str(img_path1), self.model_type, self.image_cache, 
-                                                     target_size=(new_w1, new_h1))
-                    img2_resized = get_image_for_model(str(img_path2), self.model_type, self.image_cache, 
-                                                     target_size=(new_w2, new_h2))
-                
-                # Match directly with PIL Images - no temporary files needed!
-                with self.profiler.profile("tiny_roma_model_inference_fallback"):
-                    warp, certainty = self.roma_model.match(img1_resized, img2_resized)
-                
-                H, W = warp.shape[:2]
-                # Store actual resolution for tiny_roma on first match
-                if self.actual_resolution is None:
-                    self.actual_resolution = (H, W)
-                logger.info(f"  Warp shape: {warp.shape}")
-                logger.info(f"  Certainty shape: {certainty.shape}")
-                logger.info(f"  Resized image 1: {img1_resized.size}")
-                logger.info(f"  Resized image 2: {img2_resized.size}")
+                # Get resized images using unified function
+                img1_resized = get_image_for_model(str(img_path1), self.model_type, self.image_cache, 
+                                                 target_size=(new_w1, new_h1))
+                img2_resized = get_image_for_model(str(img_path2), self.model_type, self.image_cache, 
+                                                 target_size=(new_w2, new_h2))
+            
+            # Match directly with PIL Images - no temporary files needed!
+            with self.profiler.profile("tiny_roma_model_inference"):
+                warp, certainty = self.roma_model.match(img1_resized, img2_resized)
+            
+            H, W = warp.shape[:2]
+            # Store actual resolution for tiny_roma on first match
+            if self.actual_resolution is None:
+                self.actual_resolution = (H, W)
+            logger.info(f"  Warp shape: {warp.shape}")
+            logger.info(f"  Certainty shape: {certainty.shape}")
+            logger.info(f"  Resized image 1: {img1_resized.size}")
+            logger.info(f"  Resized image 2: {img2_resized.size}")
         
         match_time = time.time() - start_time
         
@@ -1119,48 +993,11 @@ class DenseMatchingPipeline:
             # Get warp resolution 
             H, W = warp.shape[:2]
             
-            # For tiny_roma with prescaling, use the pre-scaled images directly
-            if (self.model_type == "tiny_roma" and self.enable_prescaling):
-                img1_name = self.colmap_dataset.images[img_id1].name
-                img2_name = self.colmap_dataset.images[img_id2].name
-                scaled_path1 = self.scaled_images_dir / img1_name
-                scaled_path2 = self.scaled_images_dir / img2_name
-                
-                if scaled_path1.exists() and scaled_path2.exists():
-                    # Use pre-scaled images directly - they should match warp dimensions!
-                    img1_prescaled = self.image_cache.get_image(str(scaled_path1))
-                    img2_prescaled = self.image_cache.get_image(str(scaled_path2))
-                    
-                    # Get original image sizes for camera scaling calculations (efficient)
-                    orig_w1, orig_h1 = get_image_dimensions(str(img_path1))
-                    orig_w2, orig_h2 = get_image_dimensions(str(img_path2))
-                    
-                    # Check if pre-scaled images match warp dimensions exactly
-                    if img1_prescaled.size == (W, H):
-                        # Perfect match - use pre-scaled images as numpy arrays directly
-                        with self.profiler.profile("prescaled_image_reuse_perfect"):
-                            img1_np = self.image_cache.get_image(str(scaled_path1), as_numpy=True)
-                            img2_np = self.image_cache.get_image(str(scaled_path2), as_numpy=True)
-                        logger.info(f"  Using pre-scaled images directly (perfect size match: {W}x{H})")
-                    else:
-                        # Minor resize needed - but still use pre-scaled as starting point
-                        with self.profiler.profile("prescaled_image_reuse_minor_resize"):
-                            img1_np = self.image_cache.get_image(str(scaled_path1), W, H, as_numpy=True)
-                            img2_np = self.image_cache.get_image(str(scaled_path2), W, H, as_numpy=True)
-                        logger.info(f"  Using pre-scaled images with minor resize: {img1_prescaled.size} -> {W}x{H}")
-                else:
-                    # Fallback to original images (shouldn't happen often)
-                    logger.warning(f"  Pre-scaled images not found, using originals")
-                    orig_w1, orig_h1 = get_image_dimensions(str(img_path1))
-                    orig_w2, orig_h2 = get_image_dimensions(str(img_path2))
-                    img1_np = self.image_cache.get_image(str(img_path1), W, H, as_numpy=True)
-                    img2_np = self.image_cache.get_image(str(img_path2), W, H, as_numpy=True)
-            else:
-                # For roma_outdoor or tiny_roma without prescaling - use original images
-                orig_w1, orig_h1 = get_image_dimensions(str(img_path1))
-                orig_w2, orig_h2 = get_image_dimensions(str(img_path2))
-                img1_np = self.image_cache.get_image(str(img_path1), W, H, as_numpy=True)
-                img2_np = self.image_cache.get_image(str(img_path2), W, H, as_numpy=True)
+            # Use original images - cache handles resizing efficiently
+            orig_w1, orig_h1 = get_image_dimensions(str(img_path1))
+            orig_w2, orig_h2 = get_image_dimensions(str(img_path2))
+            img1_np = self.image_cache.get_image(str(img_path1), W, H, as_numpy=True)
+            img2_np = self.image_cache.get_image(str(img_path2), W, H, as_numpy=True)
         
         # Sample high-certainty correspondences
         with self.profiler.profile("correspondence_extraction"):
@@ -2212,8 +2049,8 @@ class DenseMatchingPipeline:
                         cmd_parts.extend(['-r'] + [str(x) for x in self.command_args['resolution']])
                     if self.command_args.get('enable_visualizations'):
                         cmd_parts.append('-v')
-                    if self.command_args.get('disable_prescaling'):
-                        cmd_parts.append('-S')
+
+
                     # Add other non-default parameters
                     for param in ['min_common_points', 'min_baseline', 'max_baseline', 'max_pairs_per_image', 'max_points', 'min_triangulation_angle']:
                         if param in self.command_args:
@@ -2333,8 +2170,7 @@ def main():
                        help="Minimum triangulation angle in degrees for point filtering (default: 2.0)")
     parser.add_argument("-v", "--enable_visualizations", action="store_true",
                        help="Enable saving of match visualizations")
-    parser.add_argument("-S", "--disable_prescaling", action="store_true",
-                       help="Disable image pre-scaling for tiny_roma model (slower but uses less disk space)")
+
     parser.add_argument("--cache_size", type=int, default=None,
                        help="Maximum number of cached image variants (higher = faster but more memory) (default: 100)")
     
@@ -2404,7 +2240,7 @@ def main():
         'disable_bbox_filter': False,
         'min_triangulation_angle': 2.0,
         'enable_visualizations': False,
-        'disable_prescaling': False,
+
         'cache_size': 100,
         'use_grid_sampling': False,
         'grid_percentage': 10.0,
@@ -2518,7 +2354,7 @@ def main():
         resolution=tuple(args.resolution),
         min_triangulation_angle=args.min_triangulation_angle,
         save_visualizations=args.enable_visualizations,
-        enable_prescaling=not args.disable_prescaling,
+
         command_args=command_args,
         cache_size=args.cache_size,
         include_cameras_in_bbox=config['include_cameras_in_bbox'],

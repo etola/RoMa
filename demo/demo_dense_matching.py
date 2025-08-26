@@ -831,6 +831,104 @@ class DenseMatchingPipeline:
         
         return warp, certainty, info
     
+    def _grid_sample_points(self, valid_indices: torch.Tensor, certainty: torch.Tensor, 
+                           base_threshold: float, max_points: int, grid_percentage: float,
+                           max_threshold_multiplier: float, H: int, W: int) -> torch.Tensor:
+        """
+        Sample points using a grid-based approach for more even distribution.
+        
+        Args:
+            valid_indices: Tensor of valid point coordinates (N, 2) where N is number of valid points
+            certainty: Full certainty map (H, W)
+            base_threshold: Base certainty threshold
+            max_points: Maximum number of points to sample
+            grid_percentage: Percentage for grid cell size (e.g., 10.0 means 10% of image dimension)
+            max_threshold_multiplier: Maximum multiplier for threshold when cells have insufficient points
+            H, W: Image height and width
+            
+        Returns:
+            Sampled valid_indices tensor
+        """
+        # Calculate grid dimensions
+        grid_size_h = max(1, int(H * grid_percentage / 100.0))
+        grid_size_w = max(1, int(W * grid_percentage / 100.0))
+        n_cells_h = (H + grid_size_h - 1) // grid_size_h  # Ceiling division
+        n_cells_w = (W + grid_size_w - 1) // grid_size_w
+        total_cells = n_cells_h * n_cells_w
+        
+        # Target points per cell
+        points_per_cell = max_points // total_cells
+        remainder_points = max_points % total_cells
+        
+        logger.info(f"  Grid sampling: {n_cells_h}x{n_cells_w} grid ({grid_size_h}x{grid_size_w} pixels per cell)")
+        logger.info(f"  Target: ~{points_per_cell} points per cell, {remainder_points} remainder")
+        
+        selected_indices = []
+        
+        for i in range(n_cells_h):
+            for j in range(n_cells_w):
+                # Define cell boundaries
+                y_start = i * grid_size_h
+                y_end = min((i + 1) * grid_size_h, H)
+                x_start = j * grid_size_w
+                x_end = min((j + 1) * grid_size_w, W)
+                
+                # Target points for this cell (distribute remainder across first cells)
+                cell_target = points_per_cell + (1 if (i * n_cells_w + j) < remainder_points else 0)
+                
+                if cell_target == 0:
+                    continue
+                
+                # Find valid indices in this cell
+                cell_mask = ((valid_indices[:, 0] >= y_start) & (valid_indices[:, 0] < y_end) &
+                            (valid_indices[:, 1] >= x_start) & (valid_indices[:, 1] < x_end))
+                cell_indices = valid_indices[cell_mask]
+                
+                # If we have enough points, sample them
+                if len(cell_indices) >= cell_target:
+                    perm = torch.randperm(len(cell_indices))[:cell_target]
+                    selected_indices.append(cell_indices[perm])
+                else:
+                    # Not enough points - try increasing threshold up to max_threshold_multiplier
+                    current_threshold = base_threshold
+                    threshold_multiplier = 1.0
+                    
+                    while (len(cell_indices) < cell_target and 
+                           threshold_multiplier <= max_threshold_multiplier):
+                        # Decrease threshold to get more points
+                        threshold_multiplier *= 1.5  # Increase by 50% each iteration
+                        current_threshold = base_threshold / threshold_multiplier
+                        
+                        # Create new mask for this cell with lower threshold
+                        cell_certainty = certainty[y_start:y_end, x_start:x_end]
+                        cell_valid_mask = cell_certainty > current_threshold
+                        cell_y_coords, cell_x_coords = torch.nonzero(cell_valid_mask, as_tuple=True)
+                        
+                        # Convert to global coordinates
+                        global_y = cell_y_coords + y_start
+                        global_x = cell_x_coords + x_start
+                        cell_indices = torch.stack([global_y, global_x], dim=1)
+                    
+                    # Sample what we have (might be less than target)
+                    if len(cell_indices) > 0:
+                        actual_sample = min(len(cell_indices), cell_target)
+                        if len(cell_indices) > actual_sample:
+                            perm = torch.randperm(len(cell_indices))[:actual_sample]
+                            selected_indices.append(cell_indices[perm])
+                        else:
+                            selected_indices.append(cell_indices)
+        
+        # Combine all selected indices
+        if selected_indices:
+            result = torch.cat(selected_indices, dim=0)
+            logger.info(f"  Grid sampling selected {len(result)} points from {len(valid_indices)} candidates")
+            return result
+        else:
+            # Fallback to random sampling if grid sampling failed
+            logger.warning(f"  Grid sampling failed, falling back to random sampling")
+            perm = torch.randperm(len(valid_indices))[:max_points]
+            return valid_indices[perm]
+    
     def generate_point_cloud(self,
                            warp: torch.Tensor,
                            certainty: torch.Tensor,
@@ -839,7 +937,10 @@ class DenseMatchingPipeline:
                            certainty_threshold: float = 0.3,
                            max_points: int = 100000,
                            use_bbox_filter: bool = True,
-                           generate_depth_map: bool = True) -> tuple[o3d.geometry.PointCloud, np.ndarray]:
+                           generate_depth_map: bool = True,
+                           use_grid_sampling: bool = False,
+                           grid_percentage: float = 10.0,
+                           max_threshold_multiplier: float = 5.0) -> tuple[o3d.geometry.PointCloud, np.ndarray]:
         """
         Generate point cloud from dense matching results.
         
@@ -849,7 +950,11 @@ class DenseMatchingPipeline:
             img_id1, img_id2: Image IDs
             certainty_threshold: Minimum certainty for triangulation
             max_points: Maximum number of points to triangulate
+            use_bbox_filter: Whether to filter points using scene bounding box
             generate_depth_map: Whether to generate depth map for image 1
+            use_grid_sampling: Whether to use grid-based sampling instead of random sampling
+            grid_percentage: Percentage of image to use for each grid cell (e.g., 10.0 means 10% => 10x10 grid)
+            max_threshold_multiplier: Maximum multiplier for certainty_threshold when grid cells have insufficient points
             
         Returns:
             tuple: (point_cloud, depth_map) where depth_map is None if generate_depth_map=False
@@ -929,9 +1034,16 @@ class DenseMatchingPipeline:
             valid_indices = torch.nonzero(mask, as_tuple=False)
             
             if len(valid_indices) > max_points:
-                # Randomly sample points
-                perm = torch.randperm(len(valid_indices))[:max_points]
-                valid_indices = valid_indices[perm]
+                if use_grid_sampling:
+                    # Grid-based sampling for more even distribution
+                    valid_indices = self._grid_sample_points(
+                        valid_indices, certainty, certainty_threshold, 
+                        max_points, grid_percentage, max_threshold_multiplier, H, W
+                    )
+                else:
+                    # Randomly sample points (original behavior)
+                    perm = torch.randperm(len(valid_indices))[:max_points]
+                    valid_indices = valid_indices[perm]
             
             logger.info(f"  Triangulating {len(valid_indices)} points")
             
@@ -1173,7 +1285,8 @@ class DenseMatchingPipeline:
         
         logger.info(f"  Saved visualizations: {vis_path.name}, {cert_path.name}")
     
-    def process_pair(self, img_id1: int, img_id2: int, pair_idx: int, use_bbox_filter: bool = True, max_points: int = 100000) -> o3d.geometry.PointCloud:
+    def process_pair(self, img_id1: int, img_id2: int, pair_idx: int, use_bbox_filter: bool = True, max_points: int = 100000,
+                     use_grid_sampling: bool = False, grid_percentage: float = 10.0, max_threshold_multiplier: float = 5.0) -> o3d.geometry.PointCloud:
         """
         Process a single image pair and return point cloud.
         
@@ -1182,6 +1295,9 @@ class DenseMatchingPipeline:
             pair_idx: Index of this pair for logging
             use_bbox_filter: Whether to filter points using scene bounding box
             max_points: Maximum number of points to triangulate
+            use_grid_sampling: Whether to use grid-based sampling instead of random sampling
+            grid_percentage: Percentage of image to use for each grid cell (e.g., 10.0 means 10% => 10x10 grid)
+            max_threshold_multiplier: Maximum multiplier for certainty_threshold when grid cells have insufficient points
             
         Returns:
             Point cloud generated from the image pair
@@ -1197,7 +1313,10 @@ class DenseMatchingPipeline:
             logger.info(f"  Visualizations not enabled (use --enable_visualizations to save)")
         
         # Generate point cloud
-        pcd, depth_map = self.generate_point_cloud(warp, certainty, img_id1, img_id2, use_bbox_filter=use_bbox_filter, max_points=max_points)
+        pcd, depth_map = self.generate_point_cloud(warp, certainty, img_id1, img_id2, 
+                                                  use_bbox_filter=use_bbox_filter, max_points=max_points,
+                                                  use_grid_sampling=use_grid_sampling, grid_percentage=grid_percentage,
+                                                  max_threshold_multiplier=max_threshold_multiplier)
         
         # Save individual point cloud
         pcd_path = self.output_dir / "point_clouds" / f"cloud_{img_id1}_{img_id2}.ply"
@@ -1308,7 +1427,10 @@ class DenseMatchingPipeline:
             max_pairs_per_image: int = 5,
             use_bbox_filter: bool = True,
             max_points: int = 100000,
-            pairs_file: str = "pairs.json"):
+            pairs_file: str = "pairs.json",
+            use_grid_sampling: bool = False,
+            grid_percentage: float = 10.0,
+            max_threshold_multiplier: float = 5.0):
         """
         Run the complete dense matching pipeline.
         
@@ -1320,6 +1442,9 @@ class DenseMatchingPipeline:
             use_bbox_filter: Whether to filter points using scene bounding box
             max_points: Maximum number of points to triangulate per pair
             pairs_file: Filename to save pairs information in output directory (default: pairs.json)
+            use_grid_sampling: Whether to use grid-based sampling instead of random sampling
+            grid_percentage: Percentage of image to use for each grid cell (e.g., 10.0 means 10% => 10x10 grid)
+            max_threshold_multiplier: Maximum multiplier for certainty_threshold when grid cells have insufficient points
         """
         logger.info("=== Starting Dense Matching Pipeline ===")
         
@@ -1354,7 +1479,9 @@ class DenseMatchingPipeline:
                 logger.info(f"\n=== Processing pair {i+1}/{total_pairs}: {img_id1} ({img_name1}) <-> {img_id2} ({img_name2}) ===")
                 
                 with self.profiler.profile("process_single_pair"):
-                    pcd = self.process_pair(img_id1, img_id2, i, use_bbox_filter=use_bbox_filter, max_points=max_points)
+                    pcd = self.process_pair(img_id1, img_id2, i, use_bbox_filter=use_bbox_filter, max_points=max_points,
+                                          use_grid_sampling=use_grid_sampling, grid_percentage=grid_percentage,
+                                          max_threshold_multiplier=max_threshold_multiplier)
                 
                 if len(pcd.points) > 0:
                     point_clouds.append(pcd)
@@ -1551,6 +1678,14 @@ def main():
     parser.add_argument("--cache_size", type=int, default=None,
                        help="Maximum number of cached image variants (higher = faster but more memory) (default: 100)")
     
+    # Grid sampling options
+    parser.add_argument("--use_grid_sampling", action="store_true",
+                       help="Use grid-based sampling instead of random sampling for more even point distribution")
+    parser.add_argument("--grid_percentage", type=float, default=None,
+                       help="Percentage of image dimension for each grid cell (e.g., 10.0 means 10%% => 10x10 grid) (default: 10.0)")
+    parser.add_argument("--max_threshold_multiplier", type=float, default=None,
+                       help="Maximum multiplier for certainty threshold when grid cells have insufficient points (default: 5.0)")
+    
     args = parser.parse_args()
     
     # Handle special commands
@@ -1600,7 +1735,10 @@ def main():
         'min_triangulation_angle': 2.0,
         'enable_visualizations': False,
         'disable_prescaling': False,
-        'cache_size': 100
+        'cache_size': 100,
+        'use_grid_sampling': False,
+        'grid_percentage': 10.0,
+        'max_threshold_multiplier': 5.0
     }
     
     for key, default_value in defaults.items():
@@ -1710,13 +1848,16 @@ def main():
     
     # Run pipeline
     pipeline.run(
-        min_common_points=args.min_common_points,
-        min_baseline=args.min_baseline,
-        max_baseline=args.max_baseline,
-        max_pairs_per_image=args.max_pairs_per_image,
-        use_bbox_filter=not args.disable_bbox_filter,
-        max_points=args.max_points,
-        pairs_file=args.pairs_file
+        min_common_points=config['min_common_points'],
+        min_baseline=config['min_baseline'],
+        max_baseline=config['max_baseline'],
+        max_pairs_per_image=config['max_pairs_per_image'],
+        use_bbox_filter=not config['disable_bbox_filter'],
+        max_points=config['max_points'],
+        pairs_file=config['pairs_file'],
+        use_grid_sampling=config['use_grid_sampling'],
+        grid_percentage=config['grid_percentage'],
+        max_threshold_multiplier=config['max_threshold_multiplier']
     )
 
 

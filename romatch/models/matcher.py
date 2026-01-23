@@ -172,6 +172,11 @@ class ConvRefiner(nn.Module):
                 d = torch.cat((x, x_hat), dim=1)
             if self.concat_logits:
                 d = torch.cat((d, logits), dim=1)
+            # pad d if needed
+            channel_d = d.shape[1]
+            channel_block1 = self.block1[0].in_channels
+            if channel_d != channel_block1:
+                d = F.pad(d, (0, 0, 0, 0, 0, channel_block1 - channel_d))
             d = self.block1(d)
             d = self.hidden_blocks(d)
         d = self.out_conv(d.float())
@@ -583,6 +588,16 @@ class RegressionMatcher(nn.Module):
             return self.upsample_res
 
     def extract_backbone_features(self, batch, batched=True, upsample=False):
+        if 'unique_images' in batch:
+            unique_images = batch['unique_images']
+            im_AB_idx = batch['im_AB_idx']
+            feature_pyramid0 = self.encoder(unique_images, upsample=upsample)
+            feature_pyramid = {
+                scale: feature_pyramid0[scale][im_AB_idx]
+                for scale in feature_pyramid0
+            }
+            return feature_pyramid
+            
         x_q = batch["im_A"]
         x_s = batch["im_B"]
         if batched:
@@ -831,7 +846,7 @@ class RegressionMatcher(nn.Module):
         if symmetric:
             corresps = self.forward_symmetric(batch, scale_factor=scale_factor)
         else:
-            corresps = self.forward(batch, batched=True, scale_factor=scale_factor)
+            corresps = self(batch, batched=True, scale_factor=scale_factor)
 
         if self.upsample_preds:
             hs, ws = self.upsample_res
@@ -884,7 +899,7 @@ class RegressionMatcher(nn.Module):
                     batch, upsample=True, batched=True, scale_factor=scale_factor
                 )
             else:
-                corresps = self.forward(
+                corresps = self(
                     batch, batched=True, upsample=True, scale_factor=scale_factor
                 )
 

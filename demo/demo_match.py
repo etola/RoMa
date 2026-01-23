@@ -39,10 +39,10 @@ if __name__ == "__main__":
     x2 = (torch.tensor(np.array(im2)) / 255).to(device).permute(2, 0, 1)
 
     im2_transfer_rgb = F.grid_sample(
-    x2[None], warp[:,:W, 2:][None], mode="bilinear", align_corners=False
+    x2[None], warp[:, :, :W, 2:], mode="bilinear", align_corners=False
     )[0]
     im1_transfer_rgb = F.grid_sample(
-    x1[None], warp[:, W:, :2][None], mode="bilinear", align_corners=False
+    x1[None], warp[:, :, W:, :2], mode="bilinear", align_corners=False
     )[0]
     warp_im = torch.cat((im2_transfer_rgb,im1_transfer_rgb),dim=2)
     white_im = torch.ones((H,2*W),device=device)
